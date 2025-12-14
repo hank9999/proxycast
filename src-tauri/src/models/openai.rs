@@ -1,6 +1,5 @@
 //! OpenAI API 数据模型
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
@@ -54,15 +53,17 @@ impl ChatMessage {
     pub fn get_content_text(&self) -> String {
         match &self.content {
             Some(MessageContent::Text(s)) => s.clone(),
-            Some(MessageContent::Parts(parts)) => {
-                parts.iter().filter_map(|p| {
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| {
                     if let ContentPart::Text { text } = p {
                         Some(text.clone())
                     } else {
                         None
                     }
-                }).collect::<Vec<_>>().join("")
-            }
+                })
+                .collect::<Vec<_>>()
+                .join(""),
             None => String::new(),
         }
     }

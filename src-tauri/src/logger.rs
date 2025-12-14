@@ -1,8 +1,8 @@
 //! 日志管理模块
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::Utc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -16,12 +16,18 @@ pub struct LogStore {
     max_logs: usize,
 }
 
-impl LogStore {
-    pub fn new() -> Self {
+impl Default for LogStore {
+    fn default() -> Self {
         Self {
             logs: Vec::new(),
             max_logs: 1000,
         }
+    }
+}
+
+impl LogStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add(&mut self, level: &str, message: &str) {
@@ -30,9 +36,9 @@ impl LogStore {
             level: level.to_string(),
             message: message.to_string(),
         };
-        
+
         self.logs.push(entry);
-        
+
         // 保持日志数量在限制内
         if self.logs.len() > self.max_logs {
             self.logs.remove(0);
@@ -48,4 +54,5 @@ impl LogStore {
     }
 }
 
+#[allow(dead_code)]
 pub type SharedLogStore = Arc<RwLock<LogStore>>;

@@ -18,9 +18,7 @@ pub enum AnthropicContentBlock {
         content: serde_json::Value,
     },
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,13 +87,19 @@ pub enum AnthropicStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: AnthropicMessageStart },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: u32, content_block: AnthropicContentBlock },
+    ContentBlockStart {
+        index: u32,
+        content_block: AnthropicContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: u32, delta: AnthropicDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: AnthropicMessageDelta, usage: AnthropicUsage },
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        usage: AnthropicUsage,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
 }

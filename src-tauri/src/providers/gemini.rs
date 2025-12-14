@@ -1,8 +1,8 @@
 //! Gemini CLI OAuth Provider
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
-use reqwest::Client;
 
 // Constants
 const CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -21,9 +21,10 @@ fn get_oauth_client_secret() -> Option<String> {
     std::env::var("GEMINI_OAUTH_CLIENT_SECRET").ok()
 }
 
+#[allow(dead_code)]
 pub const GEMINI_MODELS: &[&str] = &[
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite", 
+    "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
     "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash-preview-09-2025",
@@ -122,13 +123,19 @@ pub struct GeminiProvider {
     pub client: Client,
 }
 
-impl GeminiProvider {
-    pub fn new() -> Self {
+impl Default for GeminiProvider {
+    fn default() -> Self {
         Self {
             credentials: GeminiCredentials::default(),
             project_id: None,
             client: Client::new(),
         }
+    }
+}
+
+impl GeminiProvider {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn default_creds_path() -> PathBuf {
@@ -140,13 +147,13 @@ impl GeminiProvider {
 
     pub fn load_credentials(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let path = Self::default_creds_path();
-        
+
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let creds: GeminiCredentials = serde_json::from_str(&content)?;
             self.credentials = creds;
         }
-        
+
         Ok(())
     }
 
@@ -173,14 +180,16 @@ impl GeminiProvider {
     }
 
     pub async fn refresh_token(&mut self) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let refresh_token = self.credentials.refresh_token.as_ref()
+        let refresh_token = self
+            .credentials
+            .refresh_token
+            .as_ref()
             .ok_or("No refresh token available")?;
 
-        let client_id = get_oauth_client_id()
-            .ok_or("GEMINI_OAUTH_CLIENT_ID not set")?;
-        let client_secret = get_oauth_client_secret()
-            .ok_or("GEMINI_OAUTH_CLIENT_SECRET not set")?;
-        
+        let client_id = get_oauth_client_id().ok_or("GEMINI_OAUTH_CLIENT_ID not set")?;
+        let client_secret =
+            get_oauth_client_secret().ok_or("GEMINI_OAUTH_CLIENT_SECRET not set")?;
+
         let params = [
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
@@ -188,7 +197,8 @@ impl GeminiProvider {
             ("grant_type", "refresh_token"),
         ];
 
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://oauth2.googleapis.com/token")
             .form(&params)
             .send()
@@ -197,21 +207,20 @@ impl GeminiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Token refresh failed: {} - {}", status, body).into());
+            return Err(format!("Token refresh failed: {status} - {body}").into());
         }
 
         let data: serde_json::Value = resp.json().await?;
-        
+
         let new_token = data["access_token"]
             .as_str()
             .ok_or("No access token in response")?;
-        
+
         self.credentials.access_token = Some(new_token.to_string());
-        
+
         if let Some(expires_in) = data["expires_in"].as_i64() {
-            self.credentials.expiry_date = Some(
-                chrono::Utc::now().timestamp_millis() + expires_in * 1000
-            );
+            self.credentials.expiry_date =
+                Some(chrono::Utc::now().timestamp_millis() + expires_in * 1000);
         }
 
         // Save refreshed credentials
@@ -221,7 +230,7 @@ impl GeminiProvider {
     }
 
     pub fn get_api_url(&self, action: &str) -> String {
-        format!("{}/{}:{}", CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION, action)
+        format!("{CODE_ASSIST_ENDPOINT}/{CODE_ASSIST_API_VERSION}:{action}")
     }
 
     pub async fn call_api(
@@ -229,14 +238,18 @@ impl GeminiProvider {
         action: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
-        let token = self.credentials.access_token.as_ref()
+        let token = self
+            .credentials
+            .access_token
+            .as_ref()
             .ok_or("No access token")?;
 
         let url = self.get_api_url(action);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(body)
             .send()
@@ -245,7 +258,7 @@ impl GeminiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("API call failed: {} - {}", status, body).into());
+            return Err(format!("API call failed: {status} - {body}").into());
         }
 
         let data: serde_json::Value = resp.json().await?;
@@ -268,7 +281,7 @@ impl GeminiProvider {
         });
 
         let resp = self.call_api("loadCodeAssist", &body).await?;
-        
+
         if let Some(project) = resp["cloudaicompanionProject"].as_str() {
             if !project.is_empty() {
                 self.project_id = Some(project.to_string());
@@ -289,7 +302,7 @@ impl GeminiProvider {
         });
 
         let mut lro_resp = self.call_api("onboardUser", &onboard_body).await?;
-        
+
         // Poll until done
         for _ in 0..30 {
             if lro_resp["done"].as_bool().unwrap_or(false) {

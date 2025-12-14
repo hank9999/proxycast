@@ -1,6 +1,8 @@
 //! CodeWhisperer 响应转换为 OpenAI 格式
-use crate::models::openai::*;
+#![allow(dead_code)]
+
 use crate::models::codewhisperer::*;
+use crate::models::openai::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -14,7 +16,7 @@ pub fn convert_cw_event_to_openai_chunk(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     if let Some(resp_event) = &event.assistant_response_event {
         // 文本内容
         if let Some(content) = &resp_event.content {
@@ -34,7 +36,7 @@ pub fn convert_cw_event_to_openai_chunk(
                 }],
             });
         }
-        
+
         // Tool use
         if let Some(tool_use) = &resp_event.tool_use {
             return Some(ChatCompletionChunk {
@@ -52,7 +54,8 @@ pub fn convert_cw_event_to_openai_chunk(
                             call_type: "function".to_string(),
                             function: FunctionCall {
                                 name: tool_use.name.clone(),
-                                arguments: serde_json::to_string(&tool_use.input).unwrap_or_default(),
+                                arguments: serde_json::to_string(&tool_use.input)
+                                    .unwrap_or_default(),
                             },
                         }]),
                     },
@@ -61,7 +64,7 @@ pub fn convert_cw_event_to_openai_chunk(
             });
         }
     }
-    
+
     None
 }
 
@@ -77,9 +80,13 @@ pub fn create_openai_response(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
-    let finish_reason = if tool_calls.is_some() { "tool_calls" } else { "stop" };
-    
+
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -89,7 +96,11 @@ pub fn create_openai_response(
             index: 0,
             message: ResponseMessage {
                 role: "assistant".to_string(),
-                content: if content.is_empty() { None } else { Some(content.to_string()) },
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content.to_string())
+                },
                 tool_calls,
             },
             finish_reason: finish_reason.to_string(),
@@ -108,7 +119,7 @@ pub fn create_stream_end_chunk(model: &str, response_id: &str) -> ChatCompletion
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     ChatCompletionChunk {
         id: response_id.to_string(),
         object: "chat.completion.chunk".to_string(),

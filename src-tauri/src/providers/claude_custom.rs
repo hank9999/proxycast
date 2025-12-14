@@ -1,7 +1,7 @@
 //! Claude Custom Provider (自定义 Claude API)
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use reqwest::Client;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClaudeCustomConfig {
@@ -15,16 +15,23 @@ pub struct ClaudeCustomProvider {
     pub client: Client,
 }
 
-impl ClaudeCustomProvider {
-    pub fn new() -> Self {
+impl Default for ClaudeCustomProvider {
+    fn default() -> Self {
         Self {
             config: ClaudeCustomConfig::default(),
             client: Client::new(),
         }
     }
+}
+
+impl ClaudeCustomProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn get_base_url(&self) -> String {
-        self.config.base_url
+        self.config
+            .base_url
             .clone()
             .unwrap_or_else(|| "https://api.anthropic.com".to_string())
     }
@@ -37,13 +44,17 @@ impl ClaudeCustomProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-        let api_key = self.config.api_key.as_ref()
+        let api_key = self
+            .config
+            .api_key
+            .as_ref()
             .ok_or("Claude API key not configured")?;
 
         let base_url = self.get_base_url();
-        let url = format!("{}/v1/messages", base_url);
+        let url = format!("{base_url}/v1/messages");
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -59,13 +70,17 @@ impl ClaudeCustomProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
-        let api_key = self.config.api_key.as_ref()
+        let api_key = self
+            .config
+            .api_key
+            .as_ref()
             .ok_or("Claude API key not configured")?;
 
         let base_url = self.get_base_url();
-        let url = format!("{}/v1/messages/count_tokens", base_url);
+        let url = format!("{base_url}/v1/messages/count_tokens");
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -77,7 +92,7 @@ impl ClaudeCustomProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to count tokens: {} - {}", status, body).into());
+            return Err(format!("Failed to count tokens: {status} - {body}").into());
         }
 
         let data: serde_json::Value = resp.json().await?;

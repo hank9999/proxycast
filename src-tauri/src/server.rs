@@ -1,24 +1,24 @@
 //! HTTP API 服务器
 use crate::config::Config;
-use crate::models::openai::*;
-use crate::models::anthropic::*;
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
-use crate::providers::kiro::KiroProvider;
-use crate::providers::gemini::GeminiProvider;
-use crate::providers::qwen::QwenProvider;
-use crate::providers::openai_custom::OpenAICustomProvider;
-use crate::providers::claude_custom::ClaudeCustomProvider;
 use crate::logger::LogStore;
+use crate::models::anthropic::*;
+use crate::models::openai::*;
+use crate::providers::claude_custom::ClaudeCustomProvider;
+use crate::providers::gemini::GeminiProvider;
+use crate::providers::kiro::KiroProvider;
+use crate::providers::openai_custom::OpenAICustomProvider;
+use crate::providers::qwen::QwenProvider;
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-use axum::{
-    routing::{get, post},
-    Router, Json,
-    extract::State,
-    http::{StatusCode, HeaderMap},
-    response::{IntoResponse, Response},
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -46,16 +46,16 @@ impl ServerState {
     pub fn new(config: Config) -> Self {
         let mut kiro = KiroProvider::new();
         let _ = kiro.load_credentials();
-        
+
         let mut gemini = GeminiProvider::new();
         let _ = gemini.load_credentials();
-        
+
         let mut qwen = QwenProvider::new();
         let _ = qwen.load_credentials();
-        
+
         let openai_custom = OpenAICustomProvider::new();
         let claude_custom = ClaudeCustomProvider::new();
-        
+
         Self {
             config,
             running: false,
@@ -80,7 +80,10 @@ impl ServerState {
         }
     }
 
-    pub async fn start(&mut self, logs: Arc<RwLock<LogStore>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(
+        &mut self,
+        logs: Arc<RwLock<LogStore>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.running {
             return Ok(());
         }
@@ -91,7 +94,7 @@ impl ServerState {
         let host = self.config.server.host.clone();
         let port = self.config.server.port;
         let api_key = self.config.server.api_key.clone();
-        
+
         // 重新加载凭证
         let _ = self.kiro_provider.load_credentials();
         let kiro = self.kiro_provider.clone();
@@ -154,9 +157,9 @@ async fn run_server(
         .route("/v1/messages/count_tokens", post(count_tokens))
         .with_state(state);
 
-    let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    
+
     tracing::info!("Server listening on {}", addr);
 
     axum::serve(listener, app)
@@ -197,27 +200,33 @@ async fn models() -> impl IntoResponse {
     }))
 }
 
-async fn verify_api_key(headers: &HeaderMap, expected_key: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let auth = headers.get("authorization")
+async fn verify_api_key(
+    headers: &HeaderMap,
+    expected_key: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let auth = headers
+        .get("authorization")
         .or_else(|| headers.get("x-api-key"))
         .and_then(|v| v.to_str().ok());
-    
+
     let key = match auth {
         Some(s) if s.starts_with("Bearer ") => &s[7..],
         Some(s) => s,
-        None => return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": {"message": "No API key provided"}}))
-        )),
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": {"message": "No API key provided"}})),
+            ))
+        }
     };
-    
+
     if key != expected_key {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": {"message": "Invalid API key"}}))
+            Json(serde_json::json!({"error": {"message": "Invalid API key"}})),
         ));
     }
-    
+
     Ok(())
 }
 
@@ -227,21 +236,32 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     if let Err(e) = verify_api_key(&headers, &state.api_key).await {
-        state.logs.write().await.add("warn", "Unauthorized request to /v1/chat/completions");
+        state
+            .logs
+            .write()
+            .await
+            .add("warn", "Unauthorized request to /v1/chat/completions");
         return e.into_response();
     }
-    
-    state.logs.write().await.add("info", &format!("POST /v1/chat/completions model={}", request.model));
-    
+
+    state.logs.write().await.add(
+        "info",
+        &format!("POST /v1/chat/completions model={}", request.model),
+    );
+
     let kiro = state.kiro.read().await;
-    
+
     match kiro.call_api(&request).await {
         Ok(resp) => {
             if resp.status().is_success() {
                 // 解析 CodeWhisperer 响应并转换
                 match resp.text().await {
                     Ok(body) => {
-                        state.logs.write().await.add("info", "Request completed successfully");
+                        state
+                            .logs
+                            .write()
+                            .await
+                            .add("info", "Request completed successfully");
                         let response = serde_json::json!({
                             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                             "object": "chat.completion",
@@ -268,8 +288,9 @@ async fn chat_completions(
                     }
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": {"message": e.to_string()}}))
-                    ).into_response()
+                        Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                    )
+                        .into_response(),
                 }
             } else {
                 let status = resp.status();
@@ -282,8 +303,9 @@ async fn chat_completions(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": {"message": e.to_string()}}))
-        ).into_response()
+            Json(serde_json::json!({"error": {"message": e.to_string()}})),
+        )
+            .into_response(),
     }
 }
 
@@ -293,23 +315,34 @@ async fn anthropic_messages(
     Json(request): Json<AnthropicMessagesRequest>,
 ) -> Response {
     if let Err(e) = verify_api_key(&headers, &state.api_key).await {
-        state.logs.write().await.add("warn", "Unauthorized request to /v1/messages");
+        state
+            .logs
+            .write()
+            .await
+            .add("warn", "Unauthorized request to /v1/messages");
         return e.into_response();
     }
-    
-    state.logs.write().await.add("info", &format!("POST /v1/messages (Anthropic) model={}", request.model));
-    
+
+    state.logs.write().await.add(
+        "info",
+        &format!("POST /v1/messages (Anthropic) model={}", request.model),
+    );
+
     // 转换为 OpenAI 格式
     let openai_request = convert_anthropic_to_openai(&request);
     let kiro = state.kiro.read().await;
-    
+
     match kiro.call_api(&openai_request).await {
         Ok(resp) => {
             if resp.status().is_success() {
                 match resp.text().await {
                     Ok(body) => {
                         let content = extract_content_from_cw_response(&body);
-                        state.logs.write().await.add("info", "Anthropic request completed successfully");
+                        state
+                            .logs
+                            .write()
+                            .await
+                            .add("info", "Anthropic request completed successfully");
                         // 返回 Anthropic 格式响应
                         let response = serde_json::json!({
                             "id": format!("msg_{}", uuid::Uuid::new_v4()),
@@ -326,17 +359,29 @@ async fn anthropic_messages(
                         Json(response).into_response()
                     }
                     Err(e) => {
-                        state.logs.write().await.add("error", &format!("Response parse error: {}", e));
+                        state
+                            .logs
+                            .write()
+                            .await
+                            .add("error", &format!("Response parse error: {e}"));
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": {"message": e.to_string()}}))
-                        ).into_response()
+                            Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                        )
+                            .into_response()
                     }
                 }
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                state.logs.write().await.add("error", &format!("Upstream error {}: {}", status, &body[..body.len().min(200)]));
+                state.logs.write().await.add(
+                    "error",
+                    &format!(
+                        "Upstream error {}: {}",
+                        status,
+                        &body[..body.len().min(200)]
+                    ),
+                );
                 (
                     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     Json(serde_json::json!({"error": {"message": format!("Upstream error: {}", body)}}))
@@ -344,11 +389,16 @@ async fn anthropic_messages(
             }
         }
         Err(e) => {
-            state.logs.write().await.add("error", &format!("API call failed: {}", e));
+            state
+                .logs
+                .write()
+                .await
+                .add("error", &format!("API call failed: {e}"));
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": {"message": e.to_string()}}))
-            ).into_response()
+                Json(serde_json::json!({"error": {"message": e.to_string()}})),
+            )
+                .into_response()
         }
     }
 }
@@ -361,26 +411,28 @@ async fn count_tokens(
     if let Err(e) = verify_api_key(&headers, &state.api_key).await {
         return e.into_response();
     }
-    
+
     // Claude Code 需要这个端点，返回估算值
     Json(serde_json::json!({
         "input_tokens": 100
-    })).into_response()
+    }))
+    .into_response()
 }
 
 fn extract_content_from_cw_response(body: &str) -> String {
     // CodeWhisperer 返回 AWS Event Stream 格式
     // 使用正则提取 JSON 内容
     let mut content = String::new();
-    
+
     // 查找所有 {"content":"..."} 模式
     let re = regex::Regex::new(r#"\{"content":"([^"\\]*(\\.[^"\\]*)*)"\}"#).ok();
-    
+
     if let Some(re) = re {
         for cap in re.captures_iter(body) {
             if let Some(text) = cap.get(1) {
                 // 处理转义字符
-                let unescaped = text.as_str()
+                let unescaped = text
+                    .as_str()
                     .replace("\\n", "\n")
                     .replace("\\t", "\t")
                     .replace("\\\"", "\"")
@@ -389,7 +441,7 @@ fn extract_content_from_cw_response(body: &str) -> String {
             }
         }
     }
-    
+
     if content.is_empty() {
         // 备用方案：查找 assistantResponseEvent
         if let Some(start) = body.find(r#""content":""#) {
@@ -399,7 +451,7 @@ fn extract_content_from_cw_response(body: &str) -> String {
             }
         }
     }
-    
+
     if content.is_empty() {
         "Response received but could not parse content".to_string()
     } else {

@@ -1,11 +1,10 @@
 //! Kiro/CodeWhisperer Provider
+use crate::converter::openai_to_cw::convert_openai_to_codewhisperer;
+use crate::models::openai::*;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
-use reqwest::Client;
-use crate::models::openai::*;
-use crate::models::codewhisperer::*;
-use crate::converter::openai_to_cw::convert_openai_to_codewhisperer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,14 +39,20 @@ pub struct KiroProvider {
     pub client: Client,
 }
 
-impl KiroProvider {
-    pub fn new() -> Self {
+impl Default for KiroProvider {
+    fn default() -> Self {
         Self {
             credentials: KiroCredentials::default(),
             client: Client::new(),
         }
     }
-    
+}
+
+impl KiroProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn default_creds_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -56,27 +61,27 @@ impl KiroProvider {
             .join("cache")
             .join("kiro-auth-token.json")
     }
-    
+
     pub fn load_credentials(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let path = Self::default_creds_path();
         let dir = path.parent().unwrap();
-        
+
         let mut merged = KiroCredentials::default();
-        
+
         // 读取主凭证文件
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let creds: KiroCredentials = serde_json::from_str(&content)?;
             merge_credentials(&mut merged, &creds);
         }
-        
+
         // 读取目录中其他 JSON 文件
         if dir.is_dir() {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
                 let file_path = entry.path();
-                if file_path.extension().map(|e| e == "json").unwrap_or(false) 
-                    && file_path != path {
+                if file_path.extension().map(|e| e == "json").unwrap_or(false) && file_path != path
+                {
                     if let Ok(content) = std::fs::read_to_string(&file_path) {
                         if let Ok(creds) = serde_json::from_str::<KiroCredentials>(&content) {
                             merge_credentials(&mut merged, &creds);
@@ -85,34 +90,47 @@ impl KiroProvider {
                 }
             }
         }
-        
+
         self.credentials = merged;
         Ok(())
     }
-    
+
     pub fn get_base_url(&self) -> String {
         let region = self.credentials.region.as_deref().unwrap_or("us-east-1");
-        format!("https://codewhisperer.{}.amazonaws.com/generateAssistantResponse", region)
+        format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse")
     }
-    
+
     pub fn get_refresh_url(&self) -> String {
         let region = self.credentials.region.as_deref().unwrap_or("us-east-1");
-        let auth_method = self.credentials.auth_method.as_deref().unwrap_or("social");
-        
+        let auth_method = self
+            .credentials
+            .auth_method
+            .as_deref()
+            .unwrap_or("social")
+            .to_lowercase();
+
         if auth_method == "idc" {
-            format!("https://oidc.{}.amazonaws.com/token", region)
+            format!("https://oidc.{region}.amazonaws.com/token")
         } else {
-            format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region)
+            format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
         }
     }
-    
+
     pub async fn refresh_token(&mut self) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let refresh_token = self.credentials.refresh_token.as_ref()
+        let refresh_token = self
+            .credentials
+            .refresh_token
+            .as_ref()
             .ok_or("No refresh token")?;
-        
-        let auth_method = self.credentials.auth_method.as_deref().unwrap_or("social");
+
+        let auth_method = self
+            .credentials
+            .auth_method
+            .as_deref()
+            .unwrap_or("social")
+            .to_lowercase();
         let refresh_url = self.get_refresh_url();
-        
+
         let body = if auth_method == "idc" {
             serde_json::json!({
                 "refreshToken": refresh_token,
@@ -123,60 +141,101 @@ impl KiroProvider {
         } else {
             serde_json::json!({ "refreshToken": refresh_token })
         };
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&refresh_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
-            return Err(format!("Refresh failed: {}", resp.status()).into());
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Refresh failed: {status} {body_text}").into());
         }
-        
+
         let data: serde_json::Value = resp.json().await?;
         let new_token = data["accessToken"]
             .as_str()
             .ok_or("No access token in response")?;
-        
+
         self.credentials.access_token = Some(new_token.to_string());
-        
+
         if let Some(rt) = data["refreshToken"].as_str() {
             self.credentials.refresh_token = Some(rt.to_string());
         }
         if let Some(arn) = data["profileArn"].as_str() {
             self.credentials.profile_arn = Some(arn.to_string());
         }
-        
+
+        // 保存更新后的凭证到文件
+        self.save_credentials()?;
+
         Ok(new_token.to_string())
     }
-    
+
+    pub fn save_credentials(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let path = Self::default_creds_path();
+
+        // 读取现有文件内容
+        let mut existing: serde_json::Value = if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        // 更新字段
+        if let Some(token) = &self.credentials.access_token {
+            existing["accessToken"] = serde_json::json!(token);
+        }
+        if let Some(token) = &self.credentials.refresh_token {
+            existing["refreshToken"] = serde_json::json!(token);
+        }
+        if let Some(arn) = &self.credentials.profile_arn {
+            existing["profileArn"] = serde_json::json!(arn);
+        }
+
+        // 写回文件
+        let content = serde_json::to_string_pretty(&existing)?;
+        std::fs::write(&path, content)?;
+
+        Ok(())
+    }
+
     pub async fn call_api(
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-        let token = self.credentials.access_token.as_ref()
+        let token = self
+            .credentials
+            .access_token
+            .as_ref()
             .ok_or("No access token")?;
-        
+
         let profile_arn = if self.credentials.auth_method.as_deref() == Some("social") {
             self.credentials.profile_arn.clone()
         } else {
             None
         };
-        
+
         let cw_request = convert_openai_to_codewhisperer(request, profile_arn);
         let url = self.get_base_url();
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .json(&cw_request)
             .send()
             .await?;
-        
+
         Ok(resp)
     }
 }

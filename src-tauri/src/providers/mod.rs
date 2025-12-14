@@ -1,11 +1,16 @@
-pub mod kiro;
-pub mod gemini;
-pub mod qwen;
-pub mod openai_custom;
 pub mod claude_custom;
+pub mod gemini;
+pub mod kiro;
+pub mod openai_custom;
+pub mod qwen;
 
-pub use kiro::KiroProvider;
-pub use gemini::GeminiProvider;
-pub use qwen::QwenProvider;
-pub use openai_custom::OpenAICustomProvider;
+#[allow(unused_imports)]
 pub use claude_custom::ClaudeCustomProvider;
+#[allow(unused_imports)]
+pub use gemini::GeminiProvider;
+#[allow(unused_imports)]
+pub use kiro::KiroProvider;
+#[allow(unused_imports)]
+pub use openai_custom::OpenAICustomProvider;
+#[allow(unused_imports)]
+pub use qwen::QwenProvider;

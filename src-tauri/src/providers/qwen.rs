@@ -1,18 +1,15 @@
 //! Qwen (通义千问) OAuth Provider
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
-use reqwest::Client;
 
 // Constants
 const QWEN_DIR: &str = ".qwen";
 const CREDENTIALS_FILE: &str = "oauth_creds.json";
 const QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
 
-pub const QWEN_MODELS: &[&str] = &[
-    "qwen3-coder-plus",
-    "qwen3-coder-flash",
-];
+pub const QWEN_MODELS: &[&str] = &["qwen3-coder-plus", "qwen3-coder-flash"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QwenCredentials {
@@ -40,12 +37,18 @@ pub struct QwenProvider {
     pub client: Client,
 }
 
-impl QwenProvider {
-    pub fn new() -> Self {
+impl Default for QwenProvider {
+    fn default() -> Self {
         Self {
             credentials: QwenCredentials::default(),
             client: Client::new(),
         }
+    }
+}
+
+impl QwenProvider {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn default_creds_path() -> PathBuf {
@@ -57,13 +60,13 @@ impl QwenProvider {
 
     pub fn load_credentials(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let path = Self::default_creds_path();
-        
+
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let creds: QwenCredentials = serde_json::from_str(&content)?;
             self.credentials = creds;
         }
-        
+
         Ok(())
     }
 
@@ -90,25 +93,29 @@ impl QwenProvider {
     }
 
     pub fn get_base_url(&self) -> String {
-        self.credentials.resource_url
+        self.credentials
+            .resource_url
             .as_ref()
             .map(|url| {
                 let normalized = if url.starts_with("http") {
                     url.clone()
                 } else {
-                    format!("https://{}", url)
+                    format!("https://{url}")
                 };
                 if normalized.ends_with("/v1") {
                     normalized
                 } else {
-                    format!("{}/v1", normalized)
+                    format!("{normalized}/v1")
                 }
             })
             .unwrap_or_else(|| QWEN_BASE_URL.to_string())
     }
 
     pub async fn refresh_token(&mut self) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let refresh_token = self.credentials.refresh_token.as_ref()
+        let refresh_token = self
+            .credentials
+            .refresh_token
+            .as_ref()
             .ok_or("No refresh token available")?;
 
         let client_id = std::env::var("QWEN_OAUTH_CLIENT_ID")
@@ -122,7 +129,8 @@ impl QwenProvider {
             "client_id": client_id
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://chat.qwen.ai/api/v1/oauth2/token")
             .header("Content-Type", "application/json")
             .json(&body)
@@ -132,29 +140,28 @@ impl QwenProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Token refresh failed: {} - {}", status, body).into());
+            return Err(format!("Token refresh failed: {status} - {body}").into());
         }
 
         let data: serde_json::Value = resp.json().await?;
-        
+
         let new_token = data["access_token"]
             .as_str()
             .ok_or("No access token in response")?;
-        
+
         self.credentials.access_token = Some(new_token.to_string());
-        
+
         if let Some(rt) = data["refresh_token"].as_str() {
             self.credentials.refresh_token = Some(rt.to_string());
         }
-        
+
         if let Some(resource_url) = data["resource_url"].as_str() {
             self.credentials.resource_url = Some(resource_url.to_string());
         }
-        
+
         if let Some(expires_in) = data["expires_in"].as_i64() {
-            self.credentials.expiry_date = Some(
-                chrono::Utc::now().timestamp_millis() + expires_in * 1000
-            );
+            self.credentials.expiry_date =
+                Some(chrono::Utc::now().timestamp_millis() + expires_in * 1000);
         }
 
         // Save refreshed credentials
@@ -167,11 +174,14 @@ impl QwenProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-        let token = self.credentials.access_token.as_ref()
+        let token = self
+            .credentials
+            .access_token
+            .as_ref()
             .ok_or("No access token")?;
 
         let base_url = self.get_base_url();
-        let url = format!("{}/chat/completions", base_url);
+        let url = format!("{base_url}/chat/completions");
 
         // Ensure model is valid
         let mut req_body = request.clone();
@@ -181,9 +191,10 @@ impl QwenProvider {
             }
         }
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("X-DashScope-AuthType", "qwen-oauth")
             .json(&req_body)
