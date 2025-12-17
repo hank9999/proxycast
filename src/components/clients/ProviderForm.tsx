@@ -824,40 +824,59 @@ export function ProviderForm({
                 </div>
               ) : (
                 <div className="grid gap-2 max-h-48 overflow-y-auto">
-                  {poolCredentials.map((credential) => (
-                    <button
-                      key={credential.uuid}
-                      type="button"
-                      onClick={() => handleCredentialSelect(credential)}
-                      className={cn(
-                        "flex items-center gap-3 p-3 rounded-lg border text-left transition-all",
-                        selectedCredentialUuid === credential.uuid
-                          ? "border-primary bg-primary/10"
-                          : "border-border hover:border-muted-foreground/50 hover:bg-muted/50",
-                      )}
-                    >
-                      <div
-                        className="w-3 h-3 rounded-full flex-shrink-0"
-                        style={{
-                          backgroundColor: credential.is_healthy
-                            ? "#22c55e"
-                            : "#ef4444",
-                        }}
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="font-medium truncate">
-                          {credential.name || credential.uuid.slice(0, 8)}
-                        </p>
-                        <p className="text-xs text-muted-foreground">
-                          {credential.provider_type} ·{" "}
-                          {credential.uuid.slice(0, 8)}...
-                        </p>
-                      </div>
-                      {selectedCredentialUuid === credential.uuid && (
-                        <span className="text-xs text-primary">已选择</span>
-                      )}
-                    </button>
-                  ))}
+                  {poolCredentials.map((credential) => {
+                    // 判断凭证类型：OAuth 类型需要通过代理，API Key 类型可直接使用
+                    const isOAuthType =
+                      credential.credential_type.includes("oauth");
+                    const typeLabel = isOAuthType ? "代理" : "API Key";
+                    const typeColor = isOAuthType ? "#3b82f6" : "#22c55e";
+
+                    return (
+                      <button
+                        key={credential.uuid}
+                        type="button"
+                        onClick={() => handleCredentialSelect(credential)}
+                        className={cn(
+                          "flex items-center gap-3 p-3 rounded-lg border text-left transition-all",
+                          selectedCredentialUuid === credential.uuid
+                            ? "border-primary bg-primary/10"
+                            : "border-border hover:border-muted-foreground/50 hover:bg-muted/50",
+                        )}
+                      >
+                        <div
+                          className="w-3 h-3 rounded-full flex-shrink-0"
+                          style={{
+                            backgroundColor: credential.is_healthy
+                              ? "#22c55e"
+                              : "#ef4444",
+                          }}
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium truncate">
+                              {credential.name || credential.uuid.slice(0, 8)}
+                            </p>
+                            <span
+                              className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+                              style={{
+                                backgroundColor: `${typeColor}20`,
+                                color: typeColor,
+                              }}
+                            >
+                              {typeLabel}
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {credential.provider_type} ·{" "}
+                            {credential.uuid.slice(0, 8)}...
+                          </p>
+                        </div>
+                        {selectedCredentialUuid === credential.uuid && (
+                          <span className="text-xs text-primary">已选择</span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </div>
