@@ -87,6 +87,33 @@ fn copy_and_rename_credential_file(
         let mut creds: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| format!("解析凭证文件失败: {}", e))?;
 
+        // 检测 refreshToken 是否被截断
+        // 正常的 refreshToken 长度应该在 500+ 字符，如果小于 100 字符则可能被截断
+        if let Some(refresh_token) = creds.get("refreshToken").and_then(|v| v.as_str()) {
+            let token_len = refresh_token.len();
+
+            // 检测常见的截断模式
+            let is_truncated =
+                token_len < 100 || refresh_token.ends_with("...") || refresh_token.contains("...");
+
+            if is_truncated {
+                tracing::error!(
+                    "[KIRO] 检测到 refreshToken 被截断！长度: {}, 内容: {}",
+                    token_len,
+                    &refresh_token[..std::cmp::min(50, token_len)]
+                );
+                return Err(format!(
+                    "凭证文件中的 refreshToken 已被截断（长度: {} 字符）。\n\n⚠️ 这通常是 Kiro IDE 为了防止凭证被第三方工具使用而故意截断的。\n\n💡 解决方案：\n1. 使用 Kir-Manager 工具获取完整的凭证\n2. 或者使用其他方式获取未截断的凭证文件\n3. 正常的 refreshToken 长度应该在 500+ 字符\n\n当前 refreshToken: {}...",
+                    token_len,
+                    &refresh_token[..std::cmp::min(30, token_len)]
+                ));
+            }
+
+            tracing::info!("[KIRO] refreshToken 长度检查通过: {} 字符", token_len);
+        } else {
+            tracing::warn!("[KIRO] 凭证文件中没有 refreshToken 字段");
+        }
+
         let aws_sso_cache_dir = dirs::home_dir()
             .ok_or_else(|| "无法获取用户主目录".to_string())?
             .join(".aws")
@@ -164,9 +191,23 @@ fn copy_and_rename_credential_file(
         }
 
         if !found_credentials {
-            tracing::warn!(
-                "[KIRO] 未找到 client_id/client_secret，副本可能无法独立刷新 Token（将使用 social 认证）"
-            );
+            // 检查认证方式
+            let auth_method = creds
+                .get("authMethod")
+                .and_then(|v| v.as_str())
+                .unwrap_or("social");
+
+            if auth_method.to_lowercase() == "idc" {
+                // IdC 认证必须有 clientId/clientSecret
+                tracing::error!(
+                    "[KIRO] IdC 认证方式缺少 clientId/clientSecret，无法创建有效的凭证副本"
+                );
+                return Err(format!(
+                    "IdC 认证凭证不完整：缺少 clientId/clientSecret。\n\n💡 解决方案：\n1. 确保 ~/.aws/sso/cache/ 目录下有对应的 clientIdHash 文件\n2. 如果使用 AWS IAM Identity Center，请确保已完成完整的 SSO 登录流程\n3. 或者尝试使用 Social 认证方式的凭证"
+                ));
+            } else {
+                tracing::warn!("[KIRO] 未找到 client_id/client_secret，将使用 social 认证方式");
+            }
         }
 
         // 写入合并后的凭证到副本文件

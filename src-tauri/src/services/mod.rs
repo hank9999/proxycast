@@ -7,3 +7,4 @@ pub mod provider_pool_service;
 pub mod skill_service;
 pub mod switch;
 pub mod token_cache_service;
+pub mod usage_service;

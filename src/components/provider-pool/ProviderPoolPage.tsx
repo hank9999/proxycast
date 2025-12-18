@@ -568,6 +568,8 @@ export const ProviderPoolPage = forwardRef<ProviderPoolPageRef>(
                   // 判断是否为 OAuth 类型（需要刷新 Token 功能）
                   const isOAuthType =
                     credential.credential_type.includes("oauth");
+                  // 判断是否为 Kiro 凭证（支持用量查询）
+                  const isKiroCredential = activeTab === "kiro";
                   return (
                     <CredentialCard
                       key={credential.uuid}
@@ -585,6 +587,7 @@ export const ProviderPoolPage = forwardRef<ProviderPoolPageRef>(
                       deleting={deletingCredentials.has(credential.uuid)}
                       checkingHealth={checkingHealth === credential.uuid}
                       refreshingToken={refreshingToken === credential.uuid}
+                      isKiroCredential={isKiroCredential}
                     />
                   );
                 })}

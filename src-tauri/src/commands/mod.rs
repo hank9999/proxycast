@@ -11,4 +11,5 @@ pub mod router_cmd;
 pub mod skill_cmd;
 pub mod switch_cmd;
 pub mod telemetry_cmd;
+pub mod usage_cmd;
 pub mod websocket_cmd;

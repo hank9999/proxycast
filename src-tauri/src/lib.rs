@@ -1648,6 +1648,8 @@ pub fn run() {
             commands::injection_cmd::add_injection_rule,
             commands::injection_cmd::remove_injection_rule,
             commands::injection_cmd::update_injection_rule,
+            // Usage commands
+            commands::usage_cmd::get_kiro_usage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

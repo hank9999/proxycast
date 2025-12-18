@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   Heart,
   HeartOff,
@@ -14,11 +15,15 @@ import {
   Lock,
   User,
   Globe,
+  BarChart3,
+  ChevronUp,
 } from "lucide-react";
 import type {
   CredentialDisplay,
   CredentialSource,
 } from "@/lib/api/providerPool";
+import { usageApi, type UsageInfo } from "@/lib/api/usage";
+import { UsageDisplay } from "./UsageDisplay";
 
 interface CredentialCardProps {
   credential: CredentialDisplay;
@@ -31,6 +36,8 @@ interface CredentialCardProps {
   deleting: boolean;
   checkingHealth: boolean;
   refreshingToken?: boolean;
+  /** 是否为 Kiro 凭证（支持用量查询） */
+  isKiroCredential?: boolean;
 }
 
 export function CredentialCard({
@@ -44,7 +51,36 @@ export function CredentialCard({
   deleting,
   checkingHealth,
   refreshingToken,
+  isKiroCredential,
 }: CredentialCardProps) {
+  // 用量查询状态
+  const [usageExpanded, setUsageExpanded] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageInfo, setUsageInfo] = useState<UsageInfo | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+
+  // 查询用量
+  const handleCheckUsage = async () => {
+    if (usageExpanded && usageInfo) {
+      // 已展开且有数据，直接折叠
+      setUsageExpanded(false);
+      return;
+    }
+
+    setUsageExpanded(true);
+    setUsageLoading(true);
+    setUsageError(null);
+
+    try {
+      const info = await usageApi.getKiroUsage(credential.uuid);
+      setUsageInfo(info);
+    } catch (e) {
+      setUsageError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUsageLoading(false);
+    }
+  };
+
   const formatDate = (dateStr?: string) => {
     if (!dateStr) return "从未";
     const date = new Date(dateStr);
@@ -138,28 +174,30 @@ export function CredentialCard({
 
         {/* Main Info */}
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex flex-col gap-1.5 mb-1">
             <h4 className="font-semibold text-base truncate">
               {credential.name || `凭证 #${credential.uuid.slice(0, 8)}`}
             </h4>
-            <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium">
-              {getCredentialTypeLabel(credential.credential_type)}
-            </span>
-            <span
-              className={`rounded-full px-2 py-0.5 text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${sourceInfo.color}`}
-            >
-              <SourceIcon className="h-3 w-3 shrink-0" />
-              {sourceInfo.text}
-            </span>
-            {credential.proxy_url && (
-              <span
-                className="rounded-full px-2 py-0.5 text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
-                title={`代理: ${credential.proxy_url}`}
-              >
-                <Globe className="h-3 w-3 shrink-0" />
-                代理
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium">
+                {getCredentialTypeLabel(credential.credential_type)}
               </span>
-            )}
+              <span
+                className={`rounded-full px-2 py-0.5 text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap ${sourceInfo.color}`}
+              >
+                <SourceIcon className="h-3 w-3 shrink-0" />
+                {sourceInfo.text}
+              </span>
+              {credential.proxy_url && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
+                  title={`代理: ${credential.proxy_url}`}
+                >
+                  <Globe className="h-3 w-3 shrink-0" />
+                  代理
+                </span>
+              )}
+            </div>
           </div>
           <p className="text-xs text-muted-foreground font-mono truncate">
             {credential.uuid}
@@ -257,6 +295,24 @@ export function CredentialCard({
             </button>
           )}
 
+          {/* 用量查询按钮 - 仅 Kiro 凭证显示 */}
+          {isKiroCredential && (
+            <button
+              onClick={handleCheckUsage}
+              disabled={usageLoading}
+              className={`rounded-lg p-2 transition-colors ${
+                usageExpanded
+                  ? "bg-cyan-200 text-cyan-800 dark:bg-cyan-800 dark:text-cyan-200"
+                  : "bg-cyan-100 text-cyan-700 hover:bg-cyan-200 dark:bg-cyan-900/30 dark:text-cyan-400"
+              } disabled:opacity-50`}
+              title="查看用量"
+            >
+              <BarChart3
+                className={`h-4 w-4 ${usageLoading ? "animate-pulse" : ""}`}
+              />
+            </button>
+          )}
+
           <button
             onClick={onReset}
             className="rounded-lg bg-orange-100 p-2 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400 transition-colors"
@@ -303,6 +359,43 @@ export function CredentialCard({
         <div className="mt-3 rounded-lg bg-red-100 p-2 text-xs text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {credential.last_error_message.slice(0, 150)}
           {credential.last_error_message.length > 150 && "..."}
+        </div>
+      )}
+
+      {/* 用量信息展示区域 - 仅 Kiro 凭证 */}
+      {isKiroCredential && usageExpanded && (
+        <div className="mt-3 pt-3 border-t border-border/30">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+              <BarChart3 className="h-3 w-3" />
+              Kiro 用量
+            </span>
+            <button
+              onClick={() => setUsageExpanded(false)}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <ChevronUp className="h-4 w-4" />
+            </button>
+          </div>
+
+          {usageError ? (
+            <div className="rounded-lg bg-red-100 p-2 text-xs text-red-700 dark:bg-red-900/30 dark:text-red-300">
+              {usageError}
+            </div>
+          ) : usageInfo ? (
+            <UsageDisplay usage={usageInfo} loading={usageLoading} />
+          ) : (
+            <UsageDisplay
+              usage={{
+                subscriptionTitle: "",
+                usageLimit: 0,
+                currentUsage: 0,
+                balance: 0,
+                isLowBalance: false,
+              }}
+              loading={true}
+            />
+          )}
         </div>
       )}
     </div>

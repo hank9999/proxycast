@@ -7,3 +7,4 @@ export { VertexAISection } from "./VertexAISection";
 export { CodexSection } from "./CodexSection";
 export { IFlowSection } from "./IFlowSection";
 export { AmpConfigSection } from "./AmpConfigSection";
+export { UsageDisplay } from "./UsageDisplay";

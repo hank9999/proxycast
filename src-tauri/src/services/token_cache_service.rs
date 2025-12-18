@@ -43,6 +43,7 @@ impl TokenCacheService {
     /// 1. 检查数据库缓存是否有效
     /// 2. 如果缓存有效且未过期，直接返回
     /// 3. 如果缓存无效或即将过期，执行刷新
+    /// 4. 如果刷新失败（如 refreshToken 被截断），尝试使用源文件中的 accessToken
     pub async fn get_valid_token(&self, db: &DbConnection, uuid: &str) -> Result<String, String> {
         // 首先检查缓存
         let cached = {
@@ -65,7 +66,69 @@ impl TokenCacheService {
         }
 
         // 需要刷新（无缓存、已过期或即将过期）
-        self.refresh_and_cache(db, uuid, false).await
+        match self.refresh_and_cache(db, uuid, false).await {
+            Ok(token) => Ok(token),
+            Err(refresh_error) => {
+                // 刷新失败时，检查是否是因为 refreshToken 被截断
+                // 如果是，尝试直接使用源文件中的 accessToken（可能仍然有效）
+                if refresh_error.contains("截断") || refresh_error.contains("truncated") {
+                    tracing::warn!(
+                        "[TOKEN_CACHE] refreshToken 被截断，尝试使用源文件中的 accessToken: {}",
+                        &uuid[..8]
+                    );
+
+                    // 获取凭证信息
+                    let credential = {
+                        let conn = db.lock().map_err(|e| e.to_string())?;
+                        ProviderPoolDao::get_by_uuid(&conn, uuid)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("Credential not found: {}", uuid))?
+                    };
+
+                    // 尝试从源文件读取 accessToken
+                    match self.read_token_from_source(&credential).await {
+                        Ok(token_info) => {
+                            if let Some(token) = token_info.access_token {
+                                tracing::info!(
+                                    "[TOKEN_CACHE] 使用源文件中的 accessToken（可能已过期）: {}",
+                                    &uuid[..8]
+                                );
+                                // 注意：这个 token 可能已过期，但至少可以尝试使用
+                                // 缓存这个 token（但不设置过期时间，因为我们不知道它何时过期）
+                                let cache_info = CachedTokenInfo {
+                                    access_token: Some(token.clone()),
+                                    refresh_token: token_info.refresh_token,
+                                    expiry_time: None, // 不知道过期时间
+                                    last_refresh: Some(Utc::now()),
+                                    refresh_error_count: 1,
+                                    last_refresh_error: Some(format!(
+                                        "refreshToken 被截断，使用源文件 accessToken: {}",
+                                        refresh_error
+                                    )),
+                                };
+
+                                // 缓存到数据库
+                                if let Ok(conn) = db.lock() {
+                                    let _ = ProviderPoolDao::update_token_cache(
+                                        &conn,
+                                        uuid,
+                                        &cache_info,
+                                    );
+                                }
+
+                                return Ok(token);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("[TOKEN_CACHE] 无法从源文件读取 accessToken: {}", e);
+                        }
+                    }
+                }
+
+                // 返回原始刷新错误
+                Err(refresh_error)
+            }
+        }
     }
 
     /// 刷新 Token 并缓存到数据库

@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "proxycast"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3390,6 +3390,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
  "zip",

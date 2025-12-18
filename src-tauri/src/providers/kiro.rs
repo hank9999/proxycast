@@ -6,34 +6,104 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
 
-/// 生成设备指纹 (MAC 地址的 SHA256)
+/// 生成设备指纹 (Machine ID 的 SHA256)
+///
+/// 与 Kiro IDE 保持一致的指纹生成方式（参考 Kir-Manager）：
+/// - macOS: 使用 IOPlatformUUID（硬件级别唯一标识）
+/// - Linux: 使用 /etc/machine-id
+/// - Windows: 使用 WMI 获取系统 UUID
+///
+/// 最终返回 SHA256 哈希后的 64 字符十六进制字符串
 fn get_device_fingerprint() -> String {
+    use sha2::{Digest, Sha256};
+
+    let raw_id =
+        get_raw_machine_id().unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+
+    // 使用 SHA256 生成 64 字符的十六进制指纹
+    let mut hasher = Sha256::new();
+    hasher.update(raw_id.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+/// 获取原始 Machine ID（未哈希）
+fn get_raw_machine_id() -> Option<String> {
     use std::process::Command;
 
-    // 尝试获取 MAC 地址
-    let mac = if cfg!(target_os = "macos") {
-        Command::new("ifconfig")
+    if cfg!(target_os = "macos") {
+        // macOS: 使用 ioreg 获取 IOPlatformUUID
+        Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .and_then(|s| {
                 s.lines()
-                    .find(|l| l.contains("ether "))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .map(|s| s.to_string())
+                    .find(|l| l.contains("IOPlatformUUID"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .map(|s| s.trim().trim_matches('"').to_lowercase())
+            })
+    } else if cfg!(target_os = "linux") {
+        // Linux: 读取 /etc/machine-id 或 /var/lib/dbus/machine-id
+        std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+    } else if cfg!(target_os = "windows") {
+        // Windows: 使用 wmic 获取系统 UUID
+        Command::new("wmic")
+            .args(["csproduct", "get", "UUID"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                s.lines()
+                    .skip(1) // 跳过表头
+                    .find(|l| !l.trim().is_empty())
+                    .map(|s| s.trim().to_lowercase())
             })
     } else {
         None
-    };
+    }
+}
 
-    let mac = mac.unwrap_or_else(|| "00:00:00:00:00:00".to_string());
+/// 获取 Kiro IDE 版本号
+///
+/// 尝试从 Kiro.app 的 Info.plist 读取实际版本，失败时使用默认值
+fn get_kiro_version() -> String {
+    use std::process::Command;
 
-    // SHA256 hash
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    mac.hash(&mut hasher);
-    format!("{:016x}{:016x}", hasher.finish(), hasher.finish())
+    if cfg!(target_os = "macos") {
+        // 尝试从 Kiro.app 读取版本
+        let kiro_paths = [
+            "/Applications/Kiro.app/Contents/Info.plist",
+            // 用户目录下的安装
+            &format!(
+                "{}/Applications/Kiro.app/Contents/Info.plist",
+                dirs::home_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ),
+        ];
+
+        for plist_path in &kiro_paths {
+            if let Ok(output) = Command::new("defaults")
+                .args(["read", plist_path, "CFBundleShortVersionString"])
+                .output()
+            {
+                if let Ok(version) = String::from_utf8(output.stdout) {
+                    let version = version.trim();
+                    if !version.is_empty() {
+                        return version.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 默认版本号
+    "0.1.25".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +542,25 @@ impl KiroProvider {
             return Err("refresh_token 为空。\n💡 解决方案：\n1. 检查凭证文件是否损坏\n2. 重新生成 OAuth 凭证".to_string());
         }
 
+        let token_len = refresh_token.len();
+
+        // 检测 refreshToken 是否被截断
+        // 正常的 refreshToken 长度应该在 500+ 字符
+        let is_truncated =
+            token_len < 100 || refresh_token.ends_with("...") || refresh_token.contains("...");
+
+        if is_truncated {
+            tracing::error!(
+                "[KIRO] 检测到 refreshToken 被截断！长度: {}, 内容: {}...",
+                token_len,
+                &refresh_token[..std::cmp::min(30, token_len)]
+            );
+            return Err(format!(
+                "refreshToken 已被截断（长度: {} 字符）。\n\n⚠️ 这通常是 Kiro IDE 为了防止凭证被第三方工具使用而故意截断的。\n\n💡 解决方案：\n1. 使用 Kir-Manager 工具获取完整的凭证\n2. 或者使用其他方式获取未截断的凭证文件\n3. 正常的 refreshToken 长度应该在 500+ 字符",
+                token_len
+            ));
+        }
+
         // 检查是否看起来像有效的 token（简单的长度和格式检查）
         if refresh_token.len() < 10 {
             return Err("refresh_token 格式异常（长度过短）。\n💡 解决方案：\n1. 凭证文件可能已损坏\n2. 重新获取 OAuth 凭证".to_string());
@@ -480,28 +569,20 @@ impl KiroProvider {
         Ok(())
     }
 
-    /// 检测最佳的认证方式
-    /// 优先使用 IdC（如果有完整配置），否则回退到 social ��证
+    /// 检测认证方式
+    ///
+    /// 注意：不再自动降级！IdC 和 Social 的 refreshToken 不兼容，
+    /// 不能将 IdC 的 refreshToken 用于 Social 端点。
     pub fn detect_auth_method(&self) -> String {
-        // 检查当前设置的认证方式
-        let current_auth = self.credentials.auth_method.as_deref().unwrap_or("social");
+        // 直接返回配置中的认证方式，不做降级
+        let auth_method = self.credentials.auth_method.as_deref().unwrap_or("social");
+        tracing::debug!("[KIRO] 使用配置的认证方式: {}", auth_method);
+        auth_method.to_lowercase()
+    }
 
-        // 如果当前是 IdC 方式，检查是否有完整的 IdC 配置
-        if current_auth.to_lowercase() == "idc" {
-            if self.credentials.client_id.is_some() && self.credentials.client_secret.is_some() {
-                // IdC 配置完整，继续使用 IdC
-                tracing::debug!("[KIRO] IdC 配置完整，使用 IdC 认证");
-                "idc".to_string()
-            } else {
-                // IdC 配置不完整，降级到 social
-                tracing::warn!("[KIRO] IdC 配置不完整（缺少 client_id 或 client_secret），自动降级到 social 认证");
-                "social".to_string()
-            }
-        } else {
-            // 默认或已设置为 social
-            tracing::debug!("[KIRO] 使用 social 认证");
-            "social".to_string()
-        }
+    /// 检查 IdC 认证配置是否完整
+    pub fn is_idc_config_complete(&self) -> bool {
+        self.credentials.client_id.is_some() && self.credentials.client_secret.is_some()
     }
 
     /// 更新认证方式到凭证中（仅在内存中，需要调用 save_credentials 持久化）
@@ -533,22 +614,28 @@ impl KiroProvider {
             .ok_or("No refresh token")?
             .clone();
 
-        // 使用智能检测的认证方式，而不是直接使用配置中的方式
-        let detected_auth_method = self.detect_auth_method();
-        tracing::info!("[KIRO] 检测到的认证方式: {}", detected_auth_method);
+        // 获取认证方式
+        let auth_method = self.detect_auth_method();
+        tracing::info!("[KIRO] 使用认证方式: {}", auth_method);
 
-        // 如果检测到的方式与配置中的不同，更新配置
-        let current_auth = self.credentials.auth_method.as_deref().unwrap_or("social");
-        if current_auth != detected_auth_method {
-            tracing::info!(
-                "[KIRO] 认证方式从 {} 切换到 {}",
-                current_auth,
-                detected_auth_method
-            );
-            self.set_auth_method(&detected_auth_method);
+        // 检查 IdC 认证是否有完整配置
+        if auth_method == "idc" && !self.is_idc_config_complete() {
+            let has_client_id = self.credentials.client_id.is_some();
+            let has_client_secret = self.credentials.client_secret.is_some();
+
+            // IdC 认证缺少必要凭证，返回明确错误（不能降级到 social，因为 refreshToken 不兼容）
+            let missing = match (has_client_id, has_client_secret) {
+                (false, false) => "clientId 和 clientSecret",
+                (false, true) => "clientId",
+                (true, false) => "clientSecret",
+                _ => unreachable!(),
+            };
+
+            return Err(format!(
+                "IdC 认证配置不完整：缺少 {}。\n\n⚠️ 注意：IdC 凭证的 refreshToken 无法用于 Social 认证，必须提供完整的 IdC 配置。\n\n💡 解决方案：\n1. 删除当前凭证\n2. 重新从 Kiro IDE 获取最新的凭证文件（确保完成完整的 SSO 登录流程）\n3. 确保 ~/.aws/sso/cache/ 目录下有对应的 clientIdHash 文件\n4. 重新添加凭证到 ProxyCast",
+                missing
+            ).into());
         }
-
-        let auth_method = detected_auth_method.to_lowercase();
         let refresh_url = self.get_refresh_url();
 
         tracing::debug!(
@@ -562,8 +649,12 @@ impl KiroProvider {
             self.credentials.client_secret.is_some()
         );
 
+        // 获取设备指纹和版本号（用于 Social 认证的 User-Agent）
+        let device_fp = get_device_fingerprint();
+        let kiro_version = get_kiro_version();
+
         let resp = if auth_method == "idc" {
-            // IdC 认证使用 JSON 格式（参考 AIClient-2-API 实现）
+            // IdC 认证使用 JSON 格式（参考 Kir-Manager 实现）
             let client_id = self
                 .credentials
                 .client_id
@@ -575,7 +666,7 @@ impl KiroProvider {
                 .as_ref()
                 .ok_or("IdC 认证配置错误：缺少 client_secret。建议删除后重新添加 OAuth 凭证")?;
 
-            // 使用 JSON 格式发送请求（与 AIClient-2-API 保持一致）
+            // 使用 JSON 格式发送请求（与 Kir-Manager 保持一致）
             let body = serde_json::json!({
                 "refreshToken": &refresh_token,
                 "clientId": client_id,
@@ -585,20 +676,37 @@ impl KiroProvider {
 
             tracing::debug!("[KIRO] IdC 刷新请求体已构建");
 
+            // IdC 认证的 Headers（参考 Kir-Manager）
             self.client
                 .post(&refresh_url)
                 .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
+                .header("Host", "oidc.us-east-1.amazonaws.com")
+                .header(
+                    "x-amz-user-agent",
+                    "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js api/sso-oidc#3.738.0 m/E KiroIDE",
+                )
+                .header("User-Agent", "node")
+                .header("Accept", "*/*")
+                .header("Connection", "keep-alive")
                 .json(&body)
                 .send()
                 .await?
         } else {
-            // Social 认证使用简单的 JSON 格式
+            // Social 认证使用简单的 JSON 格式（参考 Kir-Manager）
             let body = serde_json::json!({ "refreshToken": &refresh_token });
+
+            // Social 认证的 Headers（参考 Kir-Manager）
             self.client
                 .post(&refresh_url)
+                .header(
+                    "User-Agent",
+                    format!("KiroIDE-{}-{}", kiro_version, device_fp),
+                )
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Encoding", "br, gzip, deflate")
                 .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
+                .header("Accept-Language", "*")
+                .header("Sec-Fetch-Mode", "cors")
                 .json(&body)
                 .send()
                 .await?
@@ -810,7 +918,7 @@ impl KiroProvider {
 
         // 生成设备指纹用于伪装 Kiro IDE
         let device_fp = get_device_fingerprint();
-        let kiro_version = "0.1.25";
+        let kiro_version = get_kiro_version();
 
         let resp = self
             .client
