@@ -313,7 +313,10 @@ impl ImportService {
 
         // 如果是脱敏数据，清理凭证池中的占位符
         if bundle.redacted {
-            Self::clean_redacted_credentials(&mut config);
+            let server_key_cleared = Self::clean_redacted_credentials(&mut config);
+            if server_key_cleared {
+                warnings.push("检测到脱敏的服务器 API Key，已清空，需要手动设置".to_string());
+            }
         }
 
         Ok(ImportResult::success_with_warnings(config, warnings))
@@ -469,7 +472,9 @@ impl ImportService {
     /// 清理脱敏的凭证数据
     ///
     /// 移除凭证池中使用占位符的条目
-    fn clean_redacted_credentials(config: &mut Config) {
+    fn clean_redacted_credentials(config: &mut Config) -> bool {
+        let mut server_key_cleared = false;
+
         // 清理 OpenAI 凭证池中的脱敏条目
         config
             .credential_pool
@@ -490,10 +495,13 @@ impl ImportService {
             config.providers.claude.api_key = None;
         }
 
-        // 清理服务器 API 密钥（如果是脱敏的，恢复默认值）
+        // 清理服务器 API 密钥（如果是脱敏的，清空并提示手动设置）
         if config.server.api_key == REDACTED_PLACEHOLDER {
-            config.server.api_key = "proxy_cast".to_string();
+            config.server.api_key = String::new();
+            server_key_cleared = true;
         }
+
+        server_key_cleared
     }
 
     /// 从文件导入配置
@@ -638,7 +646,7 @@ server:
         let current = Config::default();
         let yaml = r#"
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 9000
   api_key: new_key
 "#;
@@ -646,7 +654,7 @@ server:
         let result = ImportService::import_yaml(yaml, &current, &options).expect("导入应成功");
 
         assert!(result.success);
-        assert_eq!(result.config.server.host, "0.0.0.0");
+        assert_eq!(result.config.server.host, "127.0.0.1");
         assert_eq!(result.config.server.port, 9000);
         assert_eq!(result.config.server.api_key, "new_key");
     }
@@ -664,7 +672,7 @@ server:
 
         let yaml = r#"
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 9000
   api_key: new_key
 credential_pool:
@@ -677,7 +685,7 @@ credential_pool:
 
         assert!(result.success);
         // 服务器配置应被更新
-        assert_eq!(result.config.server.host, "0.0.0.0");
+        assert_eq!(result.config.server.host, "127.0.0.1");
         // 凭证池应合并
         assert_eq!(result.config.credential_pool.openai.len(), 2);
     }
@@ -757,10 +765,11 @@ credential_pool:
             proxy_url: None,
         });
 
-        ImportService::clean_redacted_credentials(&mut config);
+        let server_key_cleared = ImportService::clean_redacted_credentials(&mut config);
 
-        // 服务器 API 密钥应恢复默认值
-        assert_eq!(config.server.api_key, "proxy_cast");
+        // 服务器 API 密钥应被清空并提示手动设置
+        assert!(server_key_cleared);
+        assert_eq!(config.server.api_key, "");
         // Provider API 密钥应被清除
         assert!(config.providers.openai.api_key.is_none());
         // 凭证池中脱敏的条目应被移除

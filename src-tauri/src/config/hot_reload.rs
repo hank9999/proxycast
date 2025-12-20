@@ -370,10 +370,18 @@ impl HotReloadManager {
 
     /// 验证配置
     fn validate_config(&self, config: &Config) -> Result<(), HotReloadError> {
+        let is_localhost = is_localhost_host(&config.server.host);
+
         // 验证端口范围
         if config.server.port == 0 {
             return Err(HotReloadError::ValidationError(
                 "端口号不能为 0".to_string(),
+            ));
+        }
+
+        if !is_localhost {
+            return Err(HotReloadError::ValidationError(
+                "当前版本仅支持本地监听，请使用 127.0.0.1/localhost/::1".to_string(),
             ));
         }
 
@@ -394,6 +402,32 @@ impl HotReloadManager {
         if config.logging.retention_days == 0 {
             return Err(HotReloadError::ValidationError(
                 "日志保留天数不能为 0".to_string(),
+            ));
+        }
+
+        if config.server.api_key.trim().is_empty() {
+            return Err(HotReloadError::ValidationError(
+                "API Key 不能为空".to_string(),
+            ));
+        }
+
+        if (!is_localhost || config.remote_management.allow_remote)
+            && crate::config::is_default_api_key(&config.server.api_key)
+        {
+            return Err(HotReloadError::ValidationError(
+                "非本地访问场景下禁止使用默认 API Key，请设置强口令".to_string(),
+            ));
+        }
+
+        if config.server.tls.enable {
+            return Err(HotReloadError::ValidationError(
+                "当前版本暂不支持 TLS，请关闭 TLS 配置".to_string(),
+            ));
+        }
+
+        if config.remote_management.allow_remote {
+            return Err(HotReloadError::ValidationError(
+                "当前版本未启用 TLS，禁止开启远程管理".to_string(),
             ));
         }
 
@@ -435,6 +469,15 @@ impl HotReloadManager {
     pub fn config_path(&self) -> &Path {
         &self.config_path
     }
+}
+
+fn is_localhost_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false)
 }
 
 /// 热重载状态

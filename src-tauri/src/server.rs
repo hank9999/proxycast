@@ -268,6 +268,28 @@ impl ServerState {
         let api_key_for_state = api_key.clone(); // 用于保存到 running_api_key
         let default_provider_ref = self.default_provider_ref.clone();
 
+        if api_key.trim().is_empty() {
+            return Err("API Key 不能为空".into());
+        }
+
+        if !is_localhost_host(&host) {
+            return Err("当前版本仅支持本地监听，请使用 127.0.0.1/localhost/::1".into());
+        }
+
+        if (!is_localhost_host(&host) || self.config.remote_management.allow_remote)
+            && crate::config::is_default_api_key(&api_key)
+        {
+            return Err("非本地访问场景下禁止使用默认 API Key，请设置强口令".into());
+        }
+
+        if self.config.server.tls.enable {
+            return Err("当前版本暂不支持 TLS，请关闭 TLS 配置".into());
+        }
+
+        if self.config.remote_management.allow_remote {
+            return Err("当前版本未启用 TLS，禁止开启远程管理".into());
+        }
+
         // 重新加载凭证
         let _ = self.kiro_provider.load_credentials().await;
         let kiro = self.kiro_provider.clone();
@@ -330,6 +352,15 @@ impl ServerState {
     }
 }
 
+fn is_localhost_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false)
+}
+
 impl Clone for KiroProvider {
     fn clone(&self) -> Self {
         Self {
@@ -346,6 +377,9 @@ struct AppState {
     api_key: String,
     base_url: String,
     default_provider: Arc<RwLock<String>>,
+    config: Option<Config>,
+    config_manager: Option<Arc<std::sync::RwLock<ConfigManager>>>,
+    start_time: std::time::Instant,
     kiro: Arc<RwLock<KiroProvider>>,
     logs: Arc<RwLock<LogStore>>,
     kiro_refresh_lock: Arc<tokio::sync::Mutex<()>>,
@@ -704,6 +738,9 @@ async fn run_server(
         api_key: api_key.to_string(),
         base_url,
         default_provider,
+        config: config.clone(),
+        config_manager: config_manager.clone(),
+        start_time: std::time::Instant::now(),
         kiro: Arc::new(RwLock::new(kiro)),
         logs,
         kiro_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -809,19 +846,54 @@ async fn run_server(
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+    })
+    .await?;
 
     Ok(())
 }
 
-async fn health() -> impl IntoResponse {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let (db_ready, pool_stats) = match &state.db {
+        Some(db) => {
+            let db_ok = db
+                .lock()
+                .map(|conn| conn.query_row::<i32, _, _>("SELECT 1", [], |row| row.get(0)))
+                .is_ok();
+            let stats = if db_ok {
+                state.pool_service.get_overview(db).ok().map(|items| {
+                    let mut total = 0usize;
+                    let mut healthy = 0usize;
+                    let mut disabled = 0usize;
+                    for item in items {
+                        total += item.stats.total_count;
+                        healthy += item.stats.healthy_count;
+                        disabled += item.stats.disabled_count;
+                    }
+                    serde_json::json!({
+                        "total": total,
+                        "healthy": healthy,
+                        "disabled": disabled
+                    })
+                })
+            } else {
+                None
+            };
+            (db_ok, stats)
+        }
+        None => (false, None),
+    };
+
     Json(serde_json::json!({
         "status": "healthy",
-        "version": "0.10.1"
+        "version": env!("CARGO_PKG_VERSION"),
+        "db_ready": db_ready,
+        "pool": pool_stats
     }))
 }
 
@@ -4885,21 +4957,32 @@ pub struct UpdateConfigResponse {
     pub message: String,
 }
 
+fn snapshot_config(state: &AppState) -> Option<Config> {
+    if let Some(manager) = &state.config_manager {
+        if let Ok(guard) = manager.read() {
+            return Some(guard.config().clone());
+        }
+    }
+    state.config.clone()
+}
+
 /// GET /v0/management/status - 获取服务器状态
 pub async fn management_status(State(state): State<AppState>) -> impl IntoResponse {
     let default_provider = state.default_provider.read().await.clone();
 
     // 获取请求数量
     let requests = state.processor.stats.read().len() as u64;
+    let config = snapshot_config(&state).unwrap_or_default();
+    let uptime_secs = state.start_time.elapsed().as_secs();
 
     let response = ManagementStatusResponse {
         running: true,
-        host: "0.0.0.0".to_string(),
-        port: 8999,
+        host: config.server.host,
+        port: config.server.port,
         requests,
-        uptime_secs: 0, // TODO: Track actual uptime
+        uptime_secs,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        tls_enabled: false,
+        tls_enabled: config.server.tls.enable,
         default_provider,
     };
 
@@ -5221,26 +5304,32 @@ pub async fn management_get_config(State(state): State<AppState>) -> impl IntoRe
 
     // 获取路由规则数量
     let rules_count = state.processor.router.read().await.rules().len();
+    let config = snapshot_config(&state).unwrap_or_default();
 
     let response = ManagementConfigResponse {
         server: ManagementServerConfigInfo {
-            host: "0.0.0.0".to_string(),
-            port: 8999,
-            tls_enabled: false,
+            host: config.server.host,
+            port: config.server.port,
+            tls_enabled: config.server.tls.enable,
         },
         routing: ManagementRoutingConfigInfo {
             default_provider,
             rules_count,
         },
         retry: ManagementRetryConfigInfo {
-            max_retries: 3,
-            base_delay_ms: 1000,
-            max_delay_ms: 30000,
+            max_retries: config.retry.max_retries,
+            base_delay_ms: config.retry.base_delay_ms,
+            max_delay_ms: config.retry.max_delay_ms,
         },
         remote_management: ManagementRemoteInfo {
-            allow_remote: false,
-            has_secret_key: true,
-            disable_control_panel: false,
+            allow_remote: config.remote_management.allow_remote,
+            has_secret_key: config
+                .remote_management
+                .secret_key
+                .as_ref()
+                .map(|key| !key.is_empty())
+                .unwrap_or(false),
+            disable_control_panel: config.remote_management.disable_control_panel,
         },
     };
 
@@ -5253,6 +5342,7 @@ pub async fn management_update_config(
     Json(request): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
     let mut updated = false;
+    let mut needs_restart = false;
 
     // 更新默认 Provider
     if let Some(provider) = request.default_provider {
@@ -5261,6 +5351,29 @@ pub async fn management_update_config(
             let mut dp = state.default_provider.write().await;
             *dp = provider.clone();
             tracing::info!("[MANAGEMENT] Updated default_provider to: {}", provider);
+            if let Some(manager) = &state.config_manager {
+                if let Ok(mut guard) = manager.write() {
+                    guard.config_mut().default_provider = provider.clone();
+                    guard.config_mut().routing.default_provider = provider.clone();
+                    if let Err(err) = guard.save() {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(UpdateConfigResponse {
+                                success: false,
+                                message: format!("Failed to save config: {}", err),
+                            }),
+                        );
+                    }
+                } else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(UpdateConfigResponse {
+                            success: false,
+                            message: "Failed to lock config manager".to_string(),
+                        }),
+                    );
+                }
+            }
             updated = true;
         } else {
             return (
@@ -5273,12 +5386,67 @@ pub async fn management_update_config(
         }
     }
 
+    // 更新是否允许远程访问（需要重启生效）
+    if let Some(allow_remote) = request.allow_remote {
+        if allow_remote {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(UpdateConfigResponse {
+                    success: false,
+                    message: "当前版本未启用 TLS，禁止开启远程管理".to_string(),
+                }),
+            );
+        }
+        let manager = match &state.config_manager {
+            Some(manager) => manager,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UpdateConfigResponse {
+                        success: false,
+                        message: "Config manager is not available".to_string(),
+                    }),
+                );
+            }
+        };
+        if let Ok(mut guard) = manager.write() {
+            guard.config_mut().remote_management.allow_remote = allow_remote;
+            if let Err(err) = guard.save() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UpdateConfigResponse {
+                        success: false,
+                        message: format!("Failed to save config: {}", err),
+                    }),
+                );
+            }
+        } else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UpdateConfigResponse {
+                    success: false,
+                    message: "Failed to lock config manager".to_string(),
+                }),
+            );
+        }
+        tracing::info!(
+            "[MANAGEMENT] Updated remote_management.allow_remote to: {}",
+            allow_remote
+        );
+        updated = true;
+        needs_restart = true;
+    }
+
     if updated {
         (
             StatusCode::OK,
             Json(UpdateConfigResponse {
                 success: true,
-                message: "Configuration updated successfully".to_string(),
+                message: if needs_restart {
+                    "Configuration updated. Restart required to apply all changes.".to_string()
+                } else {
+                    "Configuration updated successfully".to_string()
+                },
             }),
         )
     } else {

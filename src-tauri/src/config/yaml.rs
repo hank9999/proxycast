@@ -708,7 +708,7 @@ mod unit_tests {
     fn test_parse_yaml_minimal() {
         let yaml = r#"
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 9000
   api_key: "test-key"
 providers:
@@ -716,7 +716,7 @@ providers:
     enabled: true
 "#;
         let config = ConfigManager::parse_yaml(yaml).unwrap();
-        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9000);
         assert_eq!(config.server.api_key, "test-key");
         assert!(config.providers.kiro.enabled);

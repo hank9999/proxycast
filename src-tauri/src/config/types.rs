@@ -334,8 +334,15 @@ fn default_port() -> u16 {
     8999
 }
 
+pub const DEFAULT_API_KEY: &str = "proxy_cast";
+
 fn default_api_key() -> String {
-    "proxy_cast".to_string()
+    DEFAULT_API_KEY.to_string()
+}
+
+/// 是否为默认 API Key
+pub fn is_default_api_key(api_key: &str) -> bool {
+    api_key == DEFAULT_API_KEY
 }
 
 impl Default for ServerConfig {

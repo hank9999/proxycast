@@ -15,8 +15,8 @@ use tempfile::NamedTempFile;
 fn arb_host() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("127.0.0.1".to_string()),
-        Just("0.0.0.0".to_string()),
         Just("localhost".to_string()),
+        Just("::1".to_string()),
         "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}".prop_map(|s| s),
     ]
 }
@@ -2120,40 +2120,36 @@ proptest! {
     /// **Validates: Requirements 5.5**
     #[test]
     fn prop_export_import_redacted_loses_secrets(config in arb_config_with_secrets()) {
-        // 导出为 YAML（脱敏）
-        let yaml = ExportService::export_yaml(&config, true)
+        // 导出为脱敏 bundle
+        let options = ExportOptions::redacted();
+        let bundle = ExportService::export(&config, &options, "1.0.0")
             .expect("导出应成功");
 
-        // 导入 YAML
+        // 导入 bundle（脱敏数据会触发清理）
         let empty_config = Config::default();
-        let options = ImportOptions::replace();
-        let result = ImportService::import_yaml(&yaml, &empty_config, &options)
+        let import_options = ImportOptions::replace();
+        let result = ImportService::import(
+            &bundle,
+            &empty_config,
+            &import_options,
+            &config.auth_dir,
+        )
             .expect("导入应成功");
 
-        // 清理脱敏数据
-        let mut imported = result.config;
-        ImportService::import(
-            &ExportBundle::new("1.0.0"),
-            &imported,
-            &ImportOptions::merge(),
-            &config.auth_dir,
-        ).ok(); // 忽略结果，只是为了触发清理
-
         // 验证脱敏后的配置不包含原始敏感信息
-        // 服务器 API 密钥应为脱敏占位符或默认值
-        prop_assert!(
-            imported.server.api_key == REDACTED_PLACEHOLDER ||
-            imported.server.api_key == "proxy_cast",
-            "脱敏后服务器 API 密钥应为占位符或默认值: {}",
-            imported.server.api_key
+        // 服务器 API 密钥应被清空
+        prop_assert_eq!(
+            result.config.server.api_key,
+            "",
+            "脱敏后服务器 API 密钥应被清空"
         );
 
         // 如果原始配置有 OpenAI API 密钥，导入后应为脱敏占位符
         if config.providers.openai.api_key.is_some() {
             prop_assert_eq!(
-                imported.providers.openai.api_key,
-                Some(REDACTED_PLACEHOLDER.to_string()),
-                "脱敏后 OpenAI API 密钥应为占位符"
+                result.config.providers.openai.api_key,
+                None,
+                "脱敏后 OpenAI API 密钥应被清空"
             );
         }
     }

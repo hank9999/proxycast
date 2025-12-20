@@ -3,7 +3,9 @@
 //! 使用 proptest 进行属性测试
 
 use crate::config::RemoteManagementConfig;
-use crate::middleware::management_auth::{ManagementAuthLayer, ManagementAuthService};
+use crate::middleware::management_auth::{
+    clear_auth_failure_state, ManagementAuthLayer, ManagementAuthService,
+};
 use axum::{
     body::Body,
     http::{Request, Response, StatusCode},
@@ -102,6 +104,49 @@ fn create_request_with_management_key(key: Option<&str>) -> Request<Body> {
     builder.body(Body::empty()).unwrap()
 }
 
+/// Helper to create a request with X-Management-Key and X-Forwarded-For headers
+fn create_request_with_management_key_and_forwarded(
+    key: Option<&str>,
+    forwarded_for: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder().uri("/v0/management/status");
+
+    if let Some(k) = key {
+        builder = builder.header("x-management-key", k);
+    }
+
+    if let Some(addr) = forwarded_for {
+        builder = builder.header("x-forwarded-for", addr);
+    }
+
+    builder.body(Body::empty()).unwrap()
+}
+
+#[test]
+fn test_management_auth_rate_limit_after_failures() {
+    clear_auth_failure_state();
+    let config = RemoteManagementConfig {
+        allow_remote: true,
+        secret_key: Some("valid_key".to_string()),
+        disable_control_panel: false,
+    };
+    let layer = ManagementAuthLayer::new(config);
+    let mut service = layer.layer(MockService);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let client_ip = "203.0.113.10";
+    for _ in 0..5 {
+        let req =
+            create_request_with_management_key_and_forwarded(Some("invalid"), Some(client_ip));
+        let response = rt.block_on(async { service.call(req).await.unwrap() });
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let req = create_request_with_management_key_and_forwarded(Some("invalid"), Some(client_ip));
+    let response = rt.block_on(async { service.call(req).await.unwrap() });
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -112,6 +157,7 @@ proptest! {
     fn prop_management_auth_rejection_missing_key(
         secret_key in arb_secret_key()
     ) {
+        clear_auth_failure_state();
         // Create config with a valid secret_key
         let config = RemoteManagementConfig {
             allow_remote: true,
@@ -147,6 +193,7 @@ proptest! {
     fn prop_management_auth_rejection_invalid_key(
         secret_key in arb_secret_key()
     ) {
+        clear_auth_failure_state();
         // Create config with a valid secret_key
         let config = RemoteManagementConfig {
             allow_remote: true,
@@ -183,6 +230,7 @@ proptest! {
     fn prop_management_auth_acceptance_valid_key(
         secret_key in arb_secret_key()
     ) {
+        clear_auth_failure_state();
         // Create config with a valid secret_key
         let config = RemoteManagementConfig {
             allow_remote: true,
@@ -218,6 +266,7 @@ proptest! {
     fn prop_management_auth_acceptance_x_management_key(
         secret_key in arb_secret_key()
     ) {
+        clear_auth_failure_state();
         // Create config with a valid secret_key
         let config = RemoteManagementConfig {
             allow_remote: true,
@@ -253,6 +302,7 @@ proptest! {
     fn prop_management_auth_rejection_invalid_x_management_key(
         secret_key in arb_secret_key()
     ) {
+        clear_auth_failure_state();
         // Create config with a valid secret_key
         let config = RemoteManagementConfig {
             allow_remote: true,

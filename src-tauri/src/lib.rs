@@ -19,6 +19,7 @@ pub mod telemetry;
 pub mod tray;
 pub mod websocket;
 
+use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{Manager, Runtime};
@@ -174,6 +175,15 @@ mod tests {
 
 pub type AppState = Arc<RwLock<server::ServerState>>;
 pub type LogState = Arc<RwLock<logger::LogStore>>;
+
+fn generate_api_key() -> String {
+    let token: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    format!("pc_{token}")
+}
 
 #[tauri::command]
 async fn start_server(
@@ -1344,12 +1354,57 @@ async fn test_api(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let config = config::load_config().unwrap_or_default();
-    let state: AppState = Arc::new(RwLock::new(server::ServerState::new(config)));
-    let logs: LogState = Arc::new(RwLock::new(logger::LogStore::new()));
+    let mut config = match config::load_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::error!("配置加载失败，已中止启动: {}", err);
+            eprintln!("配置加载失败，已中止启动: {}", err);
+            return;
+        }
+    };
+    if config.server.api_key == config::DEFAULT_API_KEY {
+        let new_key = generate_api_key();
+        config.server.api_key = new_key.clone();
+        if let Err(err) = config::save_config_yaml(&config) {
+            tracing::error!("自动生成 API key 失败，无法保存配置，已中止启动: {}", err);
+            eprintln!("自动生成 API key 失败，无法保存配置，已中止启动: {}", err);
+            return;
+        }
+        tracing::info!("检测到默认 API key，已自动生成并保存新密钥");
+        eprintln!("检测到默认 API key，已自动生成并保存新密钥");
+    }
+    if !is_loopback_host(&config.server.host) {
+        tracing::error!("当前版本仅支持本地监听，请使用 127.0.0.1/localhost/::1。");
+        eprintln!("当前版本仅支持本地监听，请使用 127.0.0.1/localhost/::1。");
+        return;
+    }
+    if config.server.api_key == config::DEFAULT_API_KEY {
+        tracing::error!("检测到使用默认 API key，已中止启动。请配置强密钥。");
+        eprintln!("检测到使用默认 API key，已中止启动。请配置强密钥。");
+        return;
+    }
+    if config.server.tls.enable {
+        tracing::error!("检测到 TLS 配置已启用，但当前版本尚未支持 TLS，已中止启动。");
+        eprintln!("检测到 TLS 配置已启用，但当前版本尚未支持 TLS，已中止启动。");
+        return;
+    }
+    if config.remote_management.allow_remote {
+        tracing::error!("检测到远程管理已开启，但当前版本未启用 TLS，已中止启动。");
+        eprintln!("检测到远程管理已开启，但当前版本未启用 TLS，已中止启动。");
+        return;
+    }
+    let state: AppState = Arc::new(RwLock::new(server::ServerState::new(config.clone())));
+    let logs: LogState = Arc::new(RwLock::new(logger::LogStore::with_config(&config.logging)));
 
     // Initialize database for Switch functionality
-    let db = database::init_database().expect("Failed to initialize database");
+    let db = match database::init_database() {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!("数据库初始化失败，已中止启动: {}", err);
+            eprintln!("数据库初始化失败，已中止启动: {}", err);
+            return;
+        }
+    };
 
     // Initialize SkillService
     let skill_service = SkillService::new().expect("Failed to initialize SkillService");
@@ -1386,8 +1441,14 @@ pub fn run() {
     let shared_tokens = Arc::new(parking_lot::RwLock::new(
         telemetry::TokenTracker::with_defaults(),
     ));
+    let log_rotation = telemetry::LogRotationConfig {
+        max_memory_logs: 10000,
+        retention_days: config.logging.retention_days,
+        max_file_size: 10 * 1024 * 1024,
+        enable_file_logging: config.logging.enabled,
+    };
     let shared_logger = Arc::new(
-        telemetry::RequestLogger::with_defaults().expect("Failed to create RequestLogger"),
+        telemetry::RequestLogger::new(log_rotation).expect("Failed to create RequestLogger"),
     );
 
     // Initialize TelemetryState with shared instances
@@ -1748,4 +1809,14 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(addr) => addr.is_loopback(),
+        Err(_) => false,
+    }
 }
