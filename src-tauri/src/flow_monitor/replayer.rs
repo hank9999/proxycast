@@ -570,7 +570,7 @@ impl FlowReplayer {
                 "https://generativelanguage.googleapis.com".to_string()
             }
             ProviderType::Qwen => "https://dashscope.aliyuncs.com".to_string(),
-            ProviderType::Kiro => "https://codewhisperer.us-east-1.amazonaws.com".to_string(),
+            ProviderType::Kiro => "https://q.us-east-1.amazonaws.com".to_string(),
             _ => "https://api.openai.com".to_string(), // 默认使用 OpenAI 兼容 API
         }
     }

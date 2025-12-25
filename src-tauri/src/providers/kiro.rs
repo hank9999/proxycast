@@ -81,7 +81,7 @@ fn get_system_runtime_info() -> (String, String) {
 
     // Node.js 版本模拟（Kiro IDE 使用 Electron，内置 Node.js）
     // 使用常见的 LTS 版本
-    let node_version = "20.18.0".to_string();
+    let node_version = "22.21.1".to_string();
 
     (os_name, node_version)
 }
@@ -190,7 +190,7 @@ fn get_kiro_version() -> String {
     }
 
     // 默认版本号
-    "0.1.25".to_string()
+    "0.8.0".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,7 +528,7 @@ impl KiroProvider {
 
     pub fn get_base_url(&self) -> String {
         let region = self.credentials.region.as_deref().unwrap_or("us-east-1");
-        format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse")
+        format!("https://q.{region}.amazonaws.com/generateAssistantResponse")
     }
 
     pub fn get_refresh_url(&self) -> String {
@@ -565,7 +565,7 @@ impl KiroProvider {
 
     /// 构建健康检查端点的静态方法，供外部服务使用
     pub fn build_health_check_url(region: &str) -> String {
-        format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse")
+        format!("https://q.{region}.amazonaws.com/generateAssistantResponse")
     }
 
     /// 检查 Token 是否已过期
@@ -1011,18 +1011,19 @@ impl KiroProvider {
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header("x-amzn-codewhisperer-optout", "true")
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("amz-sdk-request", "attempt=1; max=3")
             .header("x-amzn-kiro-agent-mode", "vibe")
             // 关键指纹头：使用基于凭证的唯一 Machine ID
             .header(
                 "x-amz-user-agent",
-                format!("aws-sdk-js/1.0.0 KiroIDE-{kiro_version}-{machine_id}"),
+                format!("aws-sdk-js/1.0.27 KiroIDE-{kiro_version}-{machine_id}"),
             )
             .header(
                 "user-agent",
                 format!(
-                    "aws-sdk-js/1.0.0 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} api/codewhispererruntime#1.0.0 m/E KiroIDE-{kiro_version}-{machine_id}"
+                    "aws-sdk-js/1.0.27 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{kiro_version}-{machine_id}"
                 ),
             )
             // 添加 Connection: close 避免连接复用被检测
@@ -1165,17 +1166,18 @@ impl StreamingProvider for KiroProvider {
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/vnd.amazon.eventstream")
+            .header("x-amzn-codewhisperer-optout", "true")
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("amz-sdk-request", "attempt=1; max=3")
             .header("x-amzn-kiro-agent-mode", "vibe")
             .header(
                 "x-amz-user-agent",
-                format!("aws-sdk-js/1.0.0 KiroIDE-{kiro_version}-{machine_id}"),
+                format!("aws-sdk-js/1.0.27 KiroIDE-{kiro_version}-{machine_id}"),
             )
             .header(
                 "user-agent",
                 format!(
-                    "aws-sdk-js/1.0.0 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} api/codewhispererruntime#1.0.0 m/E KiroIDE-{kiro_version}-{machine_id}"
+                    "aws-sdk-js/1.0.27 ua/2.1 os/{os_name} lang/js md/nodejs#{node_version} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{kiro_version}-{machine_id}"
                 ),
             )
             .header("Connection", "close")

@@ -154,7 +154,7 @@ pub fn build_usage_api_url(
 /// **Validates: Requirements 4.1, 4.2, 4.3**
 ///
 /// Headers:
-/// - User-Agent: aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/rust api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}
+/// - User-Agent: aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/js md/nodejs#22.21.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}
 /// - x-amz-user-agent: aws-sdk-js/1.0.0 KiroIDE-{version}-{machineId}
 /// - amz-sdk-invocation-id: UUID
 /// - amz-sdk-request: attempt=1; max=1
@@ -170,10 +170,10 @@ pub fn build_request_headers(
     headers.insert("Authorization", HeaderValue::from_str(&auth_value)?);
 
     // User-Agent header
-    // 格式: aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/rust api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}
+    // 格式: aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/js md/nodejs#22.21.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}
     let os_name = std::env::consts::OS;
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/rust api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#22.21.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, kiro_version, machine_id
     );
     headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
@@ -208,7 +208,7 @@ pub fn build_request_headers(
 pub fn build_user_agent(kiro_version: &str, machine_id: &str) -> String {
     let os_name = std::env::consts::OS;
     format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/rust api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#22.21.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, kiro_version, machine_id
     )
 }
@@ -869,7 +869,7 @@ mod tests {
         ///
         /// *For any* kiro_version and machine_id strings,
         /// the User-Agent header SHALL match the format:
-        /// `aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/rust api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}`
+        /// `aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/js md/nodejs#22.21.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{version}-{machineId}`
         #[test]
         fn prop_user_agent_header_format(
             kiro_version in arb_kiro_version(),
@@ -881,8 +881,8 @@ mod tests {
             prop_assert!(user_agent.starts_with("aws-sdk-js/1.0.0 ua/2.1 os/"),
                 "User-Agent should start with 'aws-sdk-js/1.0.0 ua/2.1 os/', got: {}", user_agent);
 
-            prop_assert!(user_agent.contains("lang/rust"),
-                "User-Agent should contain 'lang/rust', got: {}", user_agent);
+            prop_assert!(user_agent.contains("lang/js"),
+                "User-Agent should contain 'lang/js', got: {}", user_agent);
 
             prop_assert!(user_agent.contains("api/codewhispererruntime#1.0.0"),
                 "User-Agent should contain 'api/codewhispererruntime#1.0.0', got: {}", user_agent);
