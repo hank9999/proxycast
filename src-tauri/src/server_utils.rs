@@ -527,20 +527,43 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     let has_tool_calls = !parsed.tool_calls.is_empty();
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let model = model.to_string();
+    let events = build_anthropic_stream_events(
+        &model,
+        &message_id,
+        parsed,
+        if has_tool_calls { "tool_use" } else { "end_turn" },
+    );
+
+    // 创建 SSE 响应
+    let body_stream = stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+    let body = Body::from_stream(body_stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(body)
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build SSE response: {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
+}
+
+fn build_anthropic_stream_events(
+    model: &str,
+    message_id: &str,
+    parsed: &CWParsedResponse,
+    stop_reason: &str,
+) -> Vec<String> {
     let content = parsed.content.clone();
     let tool_calls = parsed.tool_calls.clone();
     let thinking = parsed.thinking.clone();
 
-    // 估算 output tokens: 基于响应内容长度 (约 4 字符 = 1 token)
-    let mut output_tokens: u32 = (parsed.content.len() / 4) as u32;
-    if let Some(thinking) = &thinking {
-        output_tokens += (thinking.text.len() / 4) as u32;
-    }
-    for tc in &parsed.tool_calls {
-        output_tokens += (tc.function.arguments.len() / 4) as u32;
-    }
-    // 从 context_usage_percentage 估算 input tokens
-    let input_tokens = ((parsed.context_usage_percentage / 100.0) * 200000.0) as u32;
+    let (input_tokens, output_tokens) = parsed.estimate_tokens();
 
     // 构建 SSE 事件流
     let mut events: Vec<String> = Vec::new();
@@ -564,23 +587,23 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     let mut block_index = 0;
 
     // 1.5 thinking 内容块（可选）
+    //
+    // Anthropic 官方格式要求：
+    // - content_block_start 的 content_block 不包含 signature
+    // - signature 通过 content_block_delta 的 signature_delta 发送
     if let Some(thinking) = &thinking {
         // content_block_start
-        let mut content_block = serde_json::json!({"type": "thinking", "thinking": ""});
-        if let Some(sig) = &thinking.signature {
-            content_block["signature"] = serde_json::json!(sig);
-        }
         let block_start = serde_json::json!({
             "type": "content_block_start",
             "index": block_index,
-            "content_block": content_block
+            "content_block": {"type": "thinking", "thinking": ""}
         });
         events.push(format!(
             "event: content_block_start\ndata: {block_start}\n\n"
         ));
 
         if !thinking.text.is_empty() {
-            // content_block_delta
+            // content_block_delta: thinking_delta
             let block_delta = serde_json::json!({
                 "type": "content_block_delta",
                 "index": block_index,
@@ -588,6 +611,28 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
             });
             events.push(format!(
                 "event: content_block_delta\ndata: {block_delta}\n\n"
+            ));
+        }
+
+        // 如果有 signature，则按官方格式发送 signature_delta
+        if let Some(sig) = &thinking.signature {
+            // 官方流里经常在 signature_delta 前额外出现一次空的 thinking_delta
+            let empty_thinking_delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "thinking_delta", "thinking": ""}
+            });
+            events.push(format!(
+                "event: content_block_delta\ndata: {empty_thinking_delta}\n\n"
+            ));
+
+            let signature_delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "signature_delta", "signature": sig}
+            });
+            events.push(format!(
+                "event: content_block_delta\ndata: {signature_delta}\n\n"
             ));
         }
 
@@ -602,7 +647,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     }
 
     // 2. 文本内容块 - 即使为空也要发送，Claude Code 需要至少一个 content block
-    // content_block_start
     let block_start = serde_json::json!({
         "type": "content_block_start",
         "index": block_index,
@@ -613,7 +657,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     ));
 
     if !content.is_empty() {
-        // content_block_delta - 发送完整内容
         let block_delta = serde_json::json!({
             "type": "content_block_delta",
             "index": block_index,
@@ -624,7 +667,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
         ));
     }
 
-    // content_block_stop
     let block_stop = serde_json::json!({
         "type": "content_block_stop",
         "index": block_index
@@ -635,7 +677,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
 
     // 3. Tool use 块
     for tc in &tool_calls {
-        // content_block_start
         let block_start = serde_json::json!({
             "type": "content_block_start",
             "index": block_index,
@@ -650,7 +691,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
             "event: content_block_start\ndata: {block_start}\n\n"
         ));
 
-        // content_block_delta - input_json_delta
         let partial_json = if tc.function.arguments.is_empty() {
             "{}".to_string()
         } else {
@@ -668,7 +708,6 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
             "event: content_block_delta\ndata: {block_delta}\n\n"
         ));
 
-        // content_block_stop
         let block_stop = serde_json::json!({
             "type": "content_block_stop",
             "index": block_index
@@ -682,7 +721,7 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     let message_delta = serde_json::json!({
         "type": "message_delta",
         "delta": {
-            "stop_reason": if has_tool_calls { "tool_use" } else { "end_turn" },
+            "stop_reason": stop_reason,
             "stop_sequence": null
         },
         "usage": {"output_tokens": output_tokens}
@@ -693,23 +732,7 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     let message_stop = serde_json::json!({"type": "message_stop"});
     events.push(format!("event: message_stop\ndata: {message_stop}\n\n"));
 
-    // 创建 SSE 响应
-    let body_stream = stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
-    let body = Body::from_stream(body_stream);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(body)
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to build SSE response: {}", e);
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap_or_default()
-        })
+    events
 }
 
 /// 构建 Gemini 原生请求体
@@ -866,5 +889,32 @@ mod tests {
         );
 
         assert_eq!(extract_json_from_bytes(b"not json"), None);
+    }
+
+    #[test]
+    fn test_anthropic_stream_thinking_signature_format() {
+        let mut parsed = CWParsedResponse::default();
+        parsed.thinking = Some(CWThinkingContent {
+            text: "hello".to_string(),
+            signature: Some("sig123".to_string()),
+        });
+
+        let events = build_anthropic_stream_events("claude-test-thinking", "msg_test", &parsed, "end_turn");
+
+        // 1) thinking 的 content_block_start 不应该带 signature 字段
+        let thinking_start = events
+            .iter()
+            .find(|e| e.contains("event: content_block_start") && e.contains("\"type\":\"thinking\""))
+            .expect("missing thinking content_block_start");
+        assert!(
+            !thinking_start.contains("\"signature\""),
+            "thinking content_block_start 不应包含 signature"
+        );
+
+        // 2) 必须存在 signature_delta
+        assert!(
+            events.iter().any(|e| e.contains("\"type\":\"signature_delta\"") && e.contains("sig123")),
+            "缺少 signature_delta"
+        );
     }
 }

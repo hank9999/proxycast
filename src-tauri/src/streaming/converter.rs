@@ -437,6 +437,12 @@ pub struct StreamConverter {
     text_block_index: Option<u32>,
     /// 当前打开的 thinking 内容块索引（Anthropic）
     thinking_block_index: Option<u32>,
+    /// thinking 的 signature（Anthropic），需要以 signature_delta 的形式输出
+    ///
+    /// Kiro 的 reasoningContentEvent 可能携带 signature，但 Anthropic 官方流式协议要求：
+    /// - content_block_start 的 thinking 块不包含 signature 字段
+    /// - signature 通过 content_block_delta 的 signature_delta 发送（通常在 thinking 结束前）
+    anthropic_thinking_signature_pending: Option<String>,
     /// 是否已发送 message_start（用于 Anthropic 格式）
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
@@ -469,6 +475,7 @@ impl StreamConverter {
             next_content_block_index: 0,
             text_block_index: None,
             thinking_block_index: None,
+            anthropic_thinking_signature_pending: None,
             message_started: false,
             accumulated_content: String::new(),
             kiro_thinking_tag_parser: KiroThinkingTagParser::new(),
@@ -509,6 +516,7 @@ impl StreamConverter {
         self.next_content_block_index = 0;
         self.text_block_index = None;
         self.thinking_block_index = None;
+        self.anthropic_thinking_signature_pending = None;
         self.message_started = false;
         self.accumulated_content.clear();
         self.kiro_thinking_tag_parser.reset();
@@ -613,7 +621,7 @@ impl StreamConverter {
                         }
                         KiroTextSegmentKind::Thinking => {
                             // signature 只在 reasoningContentEvent 中才可能存在，这里回退解析统一视为 None
-                            self.emit_aws_thinking_as_anthropic(&mut sse_events, &seg.text, None);
+                            self.emit_aws_thinking_as_anthropic(&mut sse_events, &seg.text);
                         }
                     }
                 }
@@ -638,12 +646,15 @@ impl StreamConverter {
                         let idx = self.next_content_block_index;
                         self.next_content_block_index += 1;
                         self.thinking_block_index = Some(idx);
-                        sse_events.push(self.create_anthropic_content_block_start_thinking(
-                            idx,
-                            signature.as_deref(),
-                        ));
+                        sse_events.push(self.create_anthropic_content_block_start_thinking(idx));
                         idx
                     };
+
+                if let Some(sig) = signature.as_deref() {
+                    if !sig.trim().is_empty() {
+                        self.anthropic_thinking_signature_pending = Some(sig.to_string());
+                    }
+                }
 
                 // thinking delta
                 sse_events.push(self.create_anthropic_thinking_delta(idx, text));
@@ -653,9 +664,7 @@ impl StreamConverter {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
 
                 // 工具调用前，关闭可能打开的 thinking/text 内容块
-                if let Some(thinking_idx) = self.thinking_block_index.take() {
-                    sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
-                }
+                self.close_anthropic_thinking_block_if_open(&mut sse_events);
                 if let Some(text_idx) = self.text_block_index.take() {
                     sse_events.push(self.create_anthropic_content_block_stop(text_idx));
                 }
@@ -853,7 +862,7 @@ impl StreamConverter {
                             self.emit_aws_content_as_anthropic(&mut out, &seg.text);
                         }
                         KiroTextSegmentKind::Thinking => {
-                            self.emit_aws_thinking_as_anthropic(&mut out, &seg.text, None);
+                            self.emit_aws_thinking_as_anthropic(&mut out, &seg.text);
                         }
                     }
                 }
@@ -873,9 +882,7 @@ impl StreamConverter {
         self.accumulated_content.push_str(text);
 
         // 如果 thinking 块还开着，先关闭它再开始输出文本
-        if let Some(thinking_idx) = self.thinking_block_index.take() {
-            sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
-        }
+        self.close_anthropic_thinking_block_if_open(sse_events);
 
         // 确保文本内容块已开始
         let text_idx = if let Some(idx) = self.text_block_index {
@@ -896,7 +903,6 @@ impl StreamConverter {
         &mut self,
         sse_events: &mut Vec<String>,
         text: &str,
-        signature: Option<&str>,
     ) {
         if text.is_empty() {
             return;
@@ -915,7 +921,7 @@ impl StreamConverter {
             let idx = self.next_content_block_index;
             self.next_content_block_index += 1;
             self.thinking_block_index = Some(idx);
-            sse_events.push(self.create_anthropic_content_block_start_thinking(idx, signature));
+            sse_events.push(self.create_anthropic_content_block_start_thinking(idx));
             idx
         };
 
@@ -1068,9 +1074,7 @@ impl StreamConverter {
             StreamFormat::AnthropicSse => {
                 let mut events = Vec::new();
                 // 关闭尚未结束的内容块（thinking / text）
-                if let Some(thinking_idx) = self.thinking_block_index.take() {
-                    events.push(self.create_anthropic_content_block_stop(thinking_idx));
-                }
+                self.close_anthropic_thinking_block_if_open(&mut events);
                 if let Some(text_idx) = self.text_block_index.take() {
                     events.push(self.create_anthropic_content_block_stop(text_idx));
                 }
@@ -1167,19 +1171,14 @@ impl StreamConverter {
     fn create_anthropic_content_block_start_thinking(
         &self,
         index: u32,
-        signature: Option<&str>,
     ) -> String {
-        let mut content_block = serde_json::json!({
-            "type": "thinking",
-            "thinking": ""
-        });
-        if let Some(sig) = signature {
-            content_block["signature"] = serde_json::json!(sig);
-        }
         let event = serde_json::json!({
             "type": "content_block_start",
             "index": index,
-            "content_block": content_block
+            "content_block": {
+                "type": "thinking",
+                "thinking": ""
+            }
         });
         format!("event: content_block_start\ndata: {}\n\n", event)
     }
@@ -1191,6 +1190,18 @@ impl StreamConverter {
             "delta": {
                 "type": "thinking_delta",
                 "thinking": thinking
+            }
+        });
+        format!("event: content_block_delta\ndata: {}\n\n", event)
+    }
+
+    fn create_anthropic_signature_delta(&self, index: u32, signature: &str) -> String {
+        let event = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "signature_delta",
+                "signature": signature
             }
         });
         format!("event: content_block_delta\ndata: {}\n\n", event)
@@ -1214,6 +1225,20 @@ impl StreamConverter {
             "index": index
         });
         format!("event: content_block_stop\ndata: {}\n\n", event)
+    }
+
+    fn close_anthropic_thinking_block_if_open(&mut self, events: &mut Vec<String>) {
+        let Some(thinking_idx) = self.thinking_block_index.take() else {
+            return;
+        };
+
+        if let Some(sig) = self.anthropic_thinking_signature_pending.take() {
+            // 官方流里经常在 signature_delta 前额外出现一次空的 thinking_delta
+            events.push(self.create_anthropic_thinking_delta(thinking_idx, ""));
+            events.push(self.create_anthropic_signature_delta(thinking_idx, &sig));
+        }
+
+        events.push(self.create_anthropic_content_block_stop(thinking_idx));
     }
 
     fn create_anthropic_message_delta(&self) -> String {
@@ -1665,6 +1690,39 @@ mod tests {
 
         let content = extract_content_from_sse(&events, StreamFormat::AnthropicSse);
         assert_eq!(content, "Hello");
+    }
+
+    #[test]
+    fn test_aws_to_anthropic_thinking_signature_delta() {
+        let mut converter = StreamConverter::with_model(
+            StreamFormat::AwsEventStream,
+            StreamFormat::AnthropicSse,
+            "test-model",
+        );
+
+        let events1 =
+            converter.convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
+        let events2 = converter.finish();
+
+        let all_events: Vec<_> = events1.into_iter().chain(events2).collect();
+
+        // thinking 的 content_block_start 不应该带 signature
+        let thinking_start = all_events
+            .iter()
+            .find(|e| e.contains("event: content_block_start") && e.contains("\"type\":\"thinking\""))
+            .expect("missing thinking content_block_start");
+        assert!(
+            !thinking_start.contains("\"signature\""),
+            "thinking content_block_start 不应包含 signature"
+        );
+
+        // 必须存在 signature_delta
+        assert!(
+            all_events
+                .iter()
+                .any(|e| e.contains("\"type\":\"signature_delta\"") && e.contains("sig")),
+            "Anthropic SSE 应输出 signature_delta"
+        );
     }
 
     #[test]
