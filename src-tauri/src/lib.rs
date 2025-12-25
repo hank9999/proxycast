@@ -1149,6 +1149,7 @@ async fn check_api_compatibility(
                     }],
                     temperature: None,
                     max_tokens: Some(100),
+                    reasoning_effort: None,
                     stream: false,
                     tools: Some(vec![crate::models::openai::Tool {
                         tool_type: "function".to_string(),
@@ -1184,6 +1185,7 @@ async fn check_api_compatibility(
                     }],
                     temperature: None,
                     max_tokens: Some(10),
+                    reasoning_effort: None,
                     stream: false,
                     tools: None,
                     tool_choice: None,

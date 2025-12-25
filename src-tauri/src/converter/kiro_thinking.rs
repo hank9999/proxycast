@@ -13,6 +13,32 @@ use crate::models::openai::{ChatCompletionRequest, ChatMessage, MessageContent};
 /// 参考社区实现：通常设置到 200000 以允许更长的推理链。
 pub const DEFAULT_MAX_THINKING_LENGTH: usize = 200_000;
 
+/// 判断 OpenAI 请求是否“显式启用”思考/推理模式。
+///
+/// 设计原则：
+/// - **只在明确请求时开启**，避免误把用户对 `<thinking>` 标签的讨论当成启用信号
+/// - 优先支持 OpenAI 侧常见扩展参数 `reasoning_effort`
+/// - 兼容 system prompt 中已存在的 `<thinking_mode>` / `<max_thinking_length>` 配置
+pub fn is_openai_thinking_enabled(request: &ChatCompletionRequest) -> bool {
+    // 1) OpenAI 扩展：reasoning_effort（low/medium/high/auto/none）
+    if let Some(effort) = request.reasoning_effort.as_deref() {
+        let effort = effort.trim().to_lowercase();
+        if !effort.is_empty() && effort != "none" {
+            return true;
+        }
+    }
+
+    // 2) 兼容：system prompt 已经包含 thinking 配置标签
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .any(|m| {
+            let text = m.get_content_text();
+            text.contains("<thinking_mode>") || text.contains("<max_thinking_length>")
+        })
+}
+
 /// 在 OpenAI 请求的 system 消息中注入 Kiro thinking 标签（如果尚未存在）。
 ///
 /// - 如果请求已经包含 `<thinking_mode>` 或 `<max_thinking_length>`，则不会重复注入。
@@ -23,11 +49,15 @@ pub fn ensure_kiro_thinking_tags(request: &mut ChatCompletionRequest, max_thinki
         max_thinking_length
     );
 
-    // 避免重复注入：只要任何消息里已经带了 thinking 标签，就认为已经配置过
-    let already_has_thinking_tags = request.messages.iter().any(|m| {
-        let text = m.get_content_text();
-        text.contains("<thinking_mode>") || text.contains("<max_thinking_length>")
-    });
+    // 避免重复注入：仅检查 system 消息（降低误判概率）
+    let already_has_thinking_tags = request
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .any(|m| {
+            let text = m.get_content_text();
+            text.contains("<thinking_mode>") || text.contains("<max_thinking_length>")
+        });
     if already_has_thinking_tags {
         return;
     }
@@ -55,4 +85,3 @@ pub fn ensure_kiro_thinking_tags(request: &mut ChatCompletionRequest, max_thinki
         },
     );
 }
-

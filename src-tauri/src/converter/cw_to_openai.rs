@@ -30,6 +30,7 @@ pub fn convert_cw_event_to_openai_chunk(
                     delta: StreamDelta {
                         role: Some("assistant".to_string()),
                         content: Some(content.clone()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: None,
@@ -49,6 +50,7 @@ pub fn convert_cw_event_to_openai_chunk(
                     delta: StreamDelta {
                         role: Some("assistant".to_string()),
                         content: None,
+                        reasoning_content: None,
                         tool_calls: Some(vec![ToolCall {
                             id: tool_use.tool_use_id.clone(),
                             call_type: "function".to_string(),
@@ -101,6 +103,7 @@ pub fn create_openai_response(
                 } else {
                     Some(content.to_string())
                 },
+                reasoning_content: None,
                 tool_calls,
             },
             finish_reason: finish_reason.to_string(),
@@ -130,6 +133,7 @@ pub fn create_stream_end_chunk(model: &str, response_id: &str) -> ChatCompletion
             delta: StreamDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             finish_reason: Some("stop".to_string()),

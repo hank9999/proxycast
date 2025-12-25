@@ -46,6 +46,7 @@ pub fn convert_anthropic_to_openai(request: &AnthropicMessagesRequest) -> ChatCo
         messages: openai_messages,
         temperature: request.temperature,
         max_tokens: request.max_tokens,
+        reasoning_effort: None,
         stream: request.stream,
         tools,
         tool_choice: request.tool_choice.clone(),

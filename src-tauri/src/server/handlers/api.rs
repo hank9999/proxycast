@@ -24,7 +24,9 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
-use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
+use crate::converter::kiro_thinking::{
+    ensure_kiro_thinking_tags, is_openai_thinking_enabled, DEFAULT_MAX_THINKING_LENGTH,
+};
 use crate::flow_monitor::{
     ClientInfo, FlowError, FlowErrorType, FlowMetadata, FlowType, InterceptAction, InterceptType,
     LLMFlow, LLMRequest, LLMResponse, Message, MessageContent, MessageRole, RequestParameters,
@@ -973,13 +975,29 @@ pub async fn chat_completions(
 
     let kiro = state.kiro.read().await;
 
-    match kiro.call_api(&request).await {
+    // OpenAI 协议侧：支持 reasoning_effort/system thinking 标签触发 Kiro 思考模式，并输出 reasoning_content
+    let thinking_enabled = is_openai_thinking_enabled(&request);
+    let mut openai_request = request.clone();
+    if thinking_enabled {
+        ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+    }
+
+    match kiro.call_api(&openai_request).await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
                 match resp.text().await {
                     Ok(body) => {
-                        let parsed = parse_cw_response(&body);
+                        let parsed = if thinking_enabled {
+                            parse_cw_response_with_options(
+                                &body,
+                                CWParseOptions {
+                                    extract_thinking: true,
+                                },
+                            )
+                        } else {
+                            parse_cw_response(&body)
+                        };
                         let has_tool_calls = !parsed.tool_calls.is_empty();
 
                         state.logs.write().await.add(
@@ -992,7 +1010,7 @@ pub async fn chat_completions(
                         );
 
                         // 构建消息
-                        let message = if has_tool_calls {
+                        let mut message = if has_tool_calls {
                             serde_json::json!({
                                 "role": "assistant",
                                 "content": if parsed.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(parsed.content) },
@@ -1013,11 +1031,22 @@ pub async fn chat_completions(
                                 "content": parsed.content
                             })
                         };
+                        if thinking_enabled {
+                            if let Some(thinking) = parsed.thinking.as_ref() {
+                                if !thinking.text.trim().is_empty() {
+                                    message["reasoning_content"] =
+                                        serde_json::json!(thinking.text);
+                                }
+                            }
+                        }
 
                         // 估算 Token 数量（基于字符数，约 4 字符 = 1 token）
-                        let estimated_output_tokens = (parsed.content.len() / 4) as u32;
+                        let mut estimated_output_tokens = (parsed.content.len() / 4) as u32;
+                        if let Some(thinking) = parsed.thinking.as_ref() {
+                            estimated_output_tokens += (thinking.text.len() / 4) as u32;
+                        }
                         // 估算输入 Token（基于请求消息）
-                        let estimated_input_tokens = request
+                        let estimated_input_tokens = openai_request
                             .messages
                             .iter()
                             .map(|m| {
@@ -1181,15 +1210,24 @@ pub async fn chat_completions(
                         // 重试请求
                         drop(kiro);
                         let kiro = state.kiro.read().await;
-                        match kiro.call_api(&request).await {
+                        match kiro.call_api(&openai_request).await {
                             Ok(retry_resp) => {
                                 if retry_resp.status().is_success() {
                                     match retry_resp.text().await {
                                         Ok(body) => {
-                                            let parsed = parse_cw_response(&body);
+                                            let parsed = if thinking_enabled {
+                                                parse_cw_response_with_options(
+                                                    &body,
+                                                    CWParseOptions {
+                                                        extract_thinking: true,
+                                                    },
+                                                )
+                                            } else {
+                                                parse_cw_response(&body)
+                                            };
                                             let has_tool_calls = !parsed.tool_calls.is_empty();
 
-                                            let message = if has_tool_calls {
+                                            let mut message = if has_tool_calls {
                                                 serde_json::json!({
                                                     "role": "assistant",
                                                     "content": if parsed.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(parsed.content) },
@@ -1210,6 +1248,14 @@ pub async fn chat_completions(
                                                     "content": parsed.content
                                                 })
                                             };
+                                            if thinking_enabled {
+                                                if let Some(thinking) = parsed.thinking.as_ref() {
+                                                    if !thinking.text.trim().is_empty() {
+                                                        message["reasoning_content"] =
+                                                            serde_json::json!(thinking.text);
+                                                    }
+                                                }
+                                            }
 
                                             let response = serde_json::json!({
                                                 "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),

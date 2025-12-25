@@ -7,7 +7,9 @@ use crate::config::{
     FileWatcher, HotReloadManager, ReloadResult,
 };
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
-use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
+use crate::converter::kiro_thinking::{
+    ensure_kiro_thinking_tags, is_openai_thinking_enabled, DEFAULT_MAX_THINKING_LENGTH,
+};
 use crate::credential::CredentialSyncService;
 use crate::database::dao::provider_pool::ProviderPoolDao;
 use crate::database::DbConnection;
@@ -1840,16 +1842,32 @@ async fn chat_completions_internal(state: &AppState, request: &ChatCompletionReq
     }
 
     let kiro = state.kiro.read().await;
-    match kiro.call_api(request).await {
+    // OpenAI 协议侧：支持 reasoning_effort/system thinking 标签触发 Kiro 思考模式，并输出 reasoning_content
+    let thinking_enabled = is_openai_thinking_enabled(request);
+    let mut openai_request = request.clone();
+    if thinking_enabled {
+        ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+    }
+
+    match kiro.call_api(&openai_request).await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
                 match resp.text().await {
                     Ok(body) => {
-                        let parsed = parse_cw_response(&body);
+                        let parsed = if thinking_enabled {
+                            parse_cw_response_with_options(
+                                &body,
+                                CWParseOptions {
+                                    extract_thinking: true,
+                                },
+                            )
+                        } else {
+                            parse_cw_response(&body)
+                        };
                         let has_tool_calls = !parsed.tool_calls.is_empty();
 
-                        let message = if has_tool_calls {
+                        let mut message = if has_tool_calls {
                             serde_json::json!({
                                 "role": "assistant",
                                 "content": if parsed.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(parsed.content) },
@@ -1870,6 +1888,14 @@ async fn chat_completions_internal(state: &AppState, request: &ChatCompletionReq
                                 "content": parsed.content
                             })
                         };
+                        if thinking_enabled {
+                            if let Some(thinking) = parsed.thinking.as_ref() {
+                                if !thinking.text.trim().is_empty() {
+                                    message["reasoning_content"] =
+                                        serde_json::json!(thinking.text);
+                                }
+                            }
+                        }
 
                         let response = serde_json::json!({
                             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),

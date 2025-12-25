@@ -440,8 +440,9 @@ impl StreamConverter {
                 // 发送 chunk
                 sse_events.push(self.create_openai_content_chunk(text, false));
             }
-            AwsEvent::Thinking { .. } => {
-                // OpenAI SSE 目前不输出 thinking（可按需扩展为 reasoning_content）
+            AwsEvent::Thinking { text, .. } => {
+                // OpenAI 协议扩展：使用 reasoning_content 输出思考内容
+                sse_events.push(self.create_openai_reasoning_chunk(text, false));
             }
             AwsEvent::ToolUseStart { id, name } => {
                 let index = self.tool_accumulators.len() as u32;
@@ -535,6 +536,13 @@ impl StreamConverter {
                                         self.accumulated_content.push_str(text);
                                         sse_events
                                             .push(self.create_openai_content_chunk(text, false));
+                                    } else if let Some(thinking) =
+                                        delta.get("thinking").and_then(|t| t.as_str())
+                                    {
+                                        // Anthropic thinking_delta -> OpenAI reasoning_content
+                                        sse_events.push(
+                                            self.create_openai_reasoning_chunk(thinking, false),
+                                        );
                                     } else if let Some(partial_json) =
                                         delta.get("partial_json").and_then(|t| t.as_str())
                                     {
@@ -824,6 +832,24 @@ impl StreamConverter {
         format!("data: {}\n\n", chunk)
     }
 
+    fn create_openai_reasoning_chunk(&self, reasoning: &str, is_first: bool) -> String {
+        let chunk = serde_json::json!({
+            "id": self.response_id,
+            "object": "chat.completion.chunk",
+            "created": self.get_created_timestamp(),
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": if is_first { Some("assistant") } else { None::<&str> },
+                    "reasoning_content": reasoning
+                },
+                "finish_reason": null
+            }]
+        });
+        format!("data: {}\n\n", chunk)
+    }
+
     fn create_openai_tool_call_chunk(
         &self,
         index: u32,
@@ -1080,6 +1106,21 @@ mod tests {
         let all_events: Vec<_> = events1.into_iter().chain(events2).collect();
         let content = extract_content_from_sse(&all_events, StreamFormat::OpenAiSse);
         assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_aws_to_openai_thinking_as_reasoning_content() {
+        let mut converter = StreamConverter::with_model(
+            StreamFormat::AwsEventStream,
+            StreamFormat::OpenAiSse,
+            "test-model",
+        );
+
+        let events = converter.convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
+        assert!(
+            events.iter().any(|e| e.contains("\"reasoning_content\"")),
+            "OpenAI SSE 应输出 reasoning_content"
+        );
     }
 
     #[test]

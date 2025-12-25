@@ -17,7 +17,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
-use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
+use crate::converter::kiro_thinking::{
+    ensure_kiro_thinking_tags, is_openai_thinking_enabled, DEFAULT_MAX_THINKING_LENGTH,
+};
 use crate::converter::openai_to_antigravity::{
     convert_antigravity_to_openai_response, convert_openai_to_antigravity_with_context,
 };
@@ -484,15 +486,30 @@ async fn handle_ws_chat_completions(
     } else {
         // 回退到 Kiro provider
         let kiro = state.kiro.read().await;
-        match kiro.call_api(&request).await {
+        let thinking_enabled = is_openai_thinking_enabled(&request);
+        let mut openai_request = request.clone();
+        if thinking_enabled {
+            ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+        }
+
+        match kiro.call_api(&openai_request).await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.text().await {
                         Ok(body) => {
-                            let parsed = parse_cw_response(&body);
+                            let parsed = if thinking_enabled {
+                                parse_cw_response_with_options(
+                                    &body,
+                                    CWParseOptions {
+                                        extract_thinking: true,
+                                    },
+                                )
+                            } else {
+                                parse_cw_response(&body)
+                            };
                             let has_tool_calls = !parsed.tool_calls.is_empty();
 
-                            let message = if has_tool_calls {
+                            let mut message = if has_tool_calls {
                                 serde_json::json!({
                                     "role": "assistant",
                                     "content": if parsed.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(parsed.content) },
@@ -513,6 +530,14 @@ async fn handle_ws_chat_completions(
                                     "content": parsed.content
                                 })
                             };
+                            if thinking_enabled {
+                                if let Some(thinking) = parsed.thinking.as_ref() {
+                                    if !thinking.text.trim().is_empty() {
+                                        message["reasoning_content"] =
+                                            serde_json::json!(thinking.text);
+                                    }
+                                }
+                            }
 
                             let response = serde_json::json!({
                                 "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -732,7 +757,13 @@ pub async fn call_provider_openai_for_ws(
                 return Err(e.to_string());
             }
 
-            let resp = match kiro.call_api(request).await {
+            let thinking_enabled = is_openai_thinking_enabled(request);
+            let mut openai_request = request.clone();
+            if thinking_enabled {
+                ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+            }
+
+            let resp = match kiro.call_api(&openai_request).await {
                 Ok(r) => r,
                 Err(e) => {
                     if let Some(db) = &state.db {
@@ -747,7 +778,16 @@ pub async fn call_provider_openai_for_ws(
             };
             if resp.status().is_success() {
                 let body = resp.text().await.map_err(|e| e.to_string())?;
-                let parsed = parse_cw_response(&body);
+                let parsed = if thinking_enabled {
+                    parse_cw_response_with_options(
+                        &body,
+                        CWParseOptions {
+                            extract_thinking: true,
+                        },
+                    )
+                } else {
+                    parse_cw_response(&body)
+                };
                 let has_tool_calls = !parsed.tool_calls.is_empty();
 
                 // 记录成功
@@ -759,7 +799,7 @@ pub async fn call_provider_openai_for_ws(
                     let _ = state.pool_service.record_usage(db, &credential.uuid);
                 }
 
-                let message = if has_tool_calls {
+                let mut message = if has_tool_calls {
                     serde_json::json!({
                         "role": "assistant",
                         "content": if parsed.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(parsed.content) },
@@ -780,6 +820,13 @@ pub async fn call_provider_openai_for_ws(
                         "content": parsed.content
                     })
                 };
+                if thinking_enabled {
+                    if let Some(thinking) = parsed.thinking.as_ref() {
+                        if !thinking.text.trim().is_empty() {
+                            message["reasoning_content"] = serde_json::json!(thinking.text);
+                        }
+                    }
+                }
 
                 Ok(serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
