@@ -391,99 +391,132 @@ impl AwsEventStreamParser {
             serde_json::from_str(json_str).map_err(|e| format!("JSON 解析错误: {}", e))?;
 
         let mut events = Vec::new();
-
-        // 处理 reasoningContentEvent（思考增量）
-        if let Some(re) = value.get("reasoningContentEvent") {
-            let text = re.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let signature = re
-                .get("signature")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string());
-
-            if !text.is_empty() {
-                events.push(AwsEvent::Thinking { text, signature });
-            }
-            return Ok(events);
-        }
-
-        // 处理 content 事件
-        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
-            // 跳过 followupPrompt
-            if value.get("followupPrompt").is_some() {
-                events.push(AwsEvent::FollowupPrompt {
-                    content: content.to_string(),
-                });
-            } else {
-                events.push(AwsEvent::Content {
-                    text: content.to_string(),
-                });
-            }
-        }
-        // 处理 tool use 事件 (包含 toolUseId)
-        else if let Some(tool_use_id) = value.get("toolUseId").and_then(|v| v.as_str()) {
-            let name = value
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input_chunk = value
-                .get("input")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_stop = value.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
-
-            let tool_id = tool_use_id.to_string();
-
-            // 获取或创建工具累积器
-            let accumulator = self.tool_accumulators.entry(tool_id.clone()).or_default();
-
-            // 如果有名称，这是工具调用开始
-            if !name.is_empty() && accumulator.name.is_empty() {
-                accumulator.name = name.clone();
-                events.push(AwsEvent::ToolUseStart {
-                    id: tool_id.clone(),
-                    name,
-                });
-            }
-
-            // 如果有输入增量
-            if !input_chunk.is_empty() {
-                accumulator.input.push_str(&input_chunk);
-                events.push(AwsEvent::ToolUseInput {
-                    id: tool_id.clone(),
-                    input: input_chunk,
-                });
-            }
-
-            // 如果是 stop 事件
-            if is_stop {
-                self.tool_accumulators.remove(&tool_id);
-                events.push(AwsEvent::ToolUseStop { id: tool_id });
-            }
-        }
-        // 处理独立的 stop 事件
-        else if value.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
-            events.push(AwsEvent::Stop);
-        }
-        // 处理 meteringEvent: {"unit":"credit","unitPlural":"credits","usage":0.34}
-        else if let Some(usage) = value.get("usage").and_then(|v| v.as_f64()) {
-            events.push(AwsEvent::Usage {
-                credits: usage,
-                context_percentage: 0.0,
-            });
-        }
-        // 处理 contextUsageEvent: {"contextUsagePercentage":54.36}
-        else if let Some(ctx_usage) = value.get("contextUsagePercentage").and_then(|v| v.as_f64())
-        {
-            events.push(AwsEvent::Usage {
-                credits: 0.0,
-                context_percentage: ctx_usage,
-            });
-        }
-
+        self.collect_events_from_value(&value, &mut events);
         Ok(events)
+    }
+
+    /// 从任意 JSON Value 中递归提取事件
+    ///
+    /// 说明：
+    /// - Kiro/AWS EventStream 的单个 JSON 负载有时会包一层事件名，例如：
+    ///   `{"assistantResponseEvent":{"content":"..."}}`
+    ///   `{"toolUseEvent":{"toolUseId":"...","name":"..."}}`
+    /// - 非流式解析（server_utils）通过扫描内嵌的 `{"content":...}` 子对象可以工作，
+    ///   但这里解析的是“完整 JSON 对象”，因此需要递归下钻以识别内层事件对象。
+    fn collect_events_from_value(
+        &mut self,
+        value: &serde_json::Value,
+        events: &mut Vec<AwsEvent>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                // 1) reasoningContentEvent（思考增量）
+                if let Some(re) = map.get("reasoningContentEvent") {
+                    let text = re.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let signature = re
+                        .get("signature")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string());
+
+                    // 重要：signature 可能出现在 text 为空的尾部事件中，
+                    // 不能因为 text 为空就丢弃，否则下游无法输出 signature_delta。
+                    if !text.is_empty() || signature.is_some() {
+                        events.push(AwsEvent::Thinking { text, signature });
+                    }
+                }
+
+                // 2) content 事件
+                if let Some(content) = map.get("content").and_then(|v| v.as_str()) {
+                    if map.get("followupPrompt").is_some() {
+                        events.push(AwsEvent::FollowupPrompt {
+                            content: content.to_string(),
+                        });
+                    } else {
+                        events.push(AwsEvent::Content {
+                            text: content.to_string(),
+                        });
+                    }
+                }
+
+                // 3) tool use 事件 (包含 toolUseId)
+                if let Some(tool_use_id) = map.get("toolUseId").and_then(|v| v.as_str()) {
+                    let name = map
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_chunk = map
+                        .get("input")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_stop = map.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    let tool_id = tool_use_id.to_string();
+
+                    // 获取或创建工具累积器
+                    let accumulator = self.tool_accumulators.entry(tool_id.clone()).or_default();
+
+                    // 如果有名称，这是工具调用开始
+                    if !name.is_empty() && accumulator.name.is_empty() {
+                        accumulator.name = name.clone();
+                        events.push(AwsEvent::ToolUseStart {
+                            id: tool_id.clone(),
+                            name,
+                        });
+                    }
+
+                    // 如果有输入增量
+                    if !input_chunk.is_empty() {
+                        accumulator.input.push_str(&input_chunk);
+                        events.push(AwsEvent::ToolUseInput {
+                            id: tool_id.clone(),
+                            input: input_chunk,
+                        });
+                    }
+
+                    // 如果是 stop 事件
+                    if is_stop {
+                        self.tool_accumulators.remove(&tool_id);
+                        events.push(AwsEvent::ToolUseStop { id: tool_id });
+                    }
+                }
+
+                // 4) 独立 stop 事件（注意：toolUse 的 stop 已在上面处理）
+                if map.get("toolUseId").is_none()
+                    && map.get("stop").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    events.push(AwsEvent::Stop);
+                }
+
+                // 5) meteringEvent / contextUsageEvent（有时会包在更外层对象里）
+                if let Some(usage) = map.get("usage").and_then(|v| v.as_f64()) {
+                    events.push(AwsEvent::Usage {
+                        credits: usage,
+                        context_percentage: 0.0,
+                    });
+                }
+                if let Some(ctx_usage) = map.get("contextUsagePercentage").and_then(|v| v.as_f64())
+                {
+                    events.push(AwsEvent::Usage {
+                        credits: 0.0,
+                        context_percentage: ctx_usage,
+                    });
+                }
+
+                // 递归处理子节点（用于处理 assistantResponseEvent/toolUseEvent 等包裹场景）
+                for child in map.values() {
+                    self.collect_events_from_value(child, events);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for child in arr {
+                    self.collect_events_from_value(child, events);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -635,6 +668,30 @@ mod tests {
         assert!(matches!(
             &events[0],
             AwsEvent::Thinking { text, signature } if text == "think" && signature.as_deref() == Some("sig")
+        ));
+    }
+
+    #[test]
+    fn test_parse_thinking_signature_without_text() {
+        let mut parser = AwsEventStreamParser::new();
+        let events = parser.process(b"{\"reasoningContentEvent\":{\"text\":\"\",\"signature\":\"sig\"}}");
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AwsEvent::Thinking { text, signature } if text.is_empty() && signature.as_deref() == Some("sig")
+        ));
+    }
+
+    #[test]
+    fn test_parse_wrapped_assistant_response_event_content() {
+        let mut parser = AwsEventStreamParser::new();
+        let events = parser.process(b"{\"assistantResponseEvent\":{\"content\":\"Hello\"}}");
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AwsEvent::Content { text } if text == "Hello"
         ));
     }
 

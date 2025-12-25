@@ -435,6 +435,11 @@ pub struct StreamConverter {
     next_content_block_index: u32,
     /// 当前打开的文本内容块索引（Anthropic）
     text_block_index: Option<u32>,
+    /// Anthropic SSE 是否已经输出过 text content block
+    ///
+    /// 一些客户端（如 Claude Code）要求至少出现一个 content block（通常是 text）。
+    /// 当上游只返回 thinking/tool_use 而没有任何内容文本时，需要在结束前补一个空的 text block。
+    anthropic_text_block_started: bool,
     /// 当前打开的 thinking 内容块索引（Anthropic）
     thinking_block_index: Option<u32>,
     /// thinking 的 signature（Anthropic），需要以 signature_delta 的形式输出
@@ -474,6 +479,7 @@ impl StreamConverter {
             tool_accumulators: HashMap::new(),
             next_content_block_index: 0,
             text_block_index: None,
+            anthropic_text_block_started: false,
             thinking_block_index: None,
             anthropic_thinking_signature_pending: None,
             message_started: false,
@@ -515,6 +521,7 @@ impl StreamConverter {
         self.tool_accumulators.clear();
         self.next_content_block_index = 0;
         self.text_block_index = None;
+        self.anthropic_text_block_started = false;
         self.thinking_block_index = None;
         self.anthropic_thinking_signature_pending = None;
         self.message_started = false;
@@ -885,15 +892,16 @@ impl StreamConverter {
         self.close_anthropic_thinking_block_if_open(sse_events);
 
         // 确保文本内容块已开始
-        let text_idx = if let Some(idx) = self.text_block_index {
-            idx
-        } else {
-            let idx = self.next_content_block_index;
-            self.next_content_block_index += 1;
-            self.text_block_index = Some(idx);
-            sse_events.push(self.create_anthropic_content_block_start_text(idx));
-            idx
-        };
+	        let text_idx = if let Some(idx) = self.text_block_index {
+	            idx
+	        } else {
+	            let idx = self.next_content_block_index;
+	            self.next_content_block_index += 1;
+	            self.text_block_index = Some(idx);
+	            self.anthropic_text_block_started = true;
+	            sse_events.push(self.create_anthropic_content_block_start_text(idx));
+	            idx
+	        };
 
         // 发送 content_block_delta
         sse_events.push(self.create_anthropic_text_delta(text_idx, text));
@@ -1073,10 +1081,24 @@ impl StreamConverter {
         match self.target_format {
             StreamFormat::AnthropicSse => {
                 let mut events = Vec::new();
+                // 确保 message_start 已发送（某些情况下上游可能直接结束，导致客户端看不到起始事件）
+                if !self.message_started {
+                    events.push(self.create_anthropic_message_start());
+                    self.message_started = true;
+                }
                 // 关闭尚未结束的内容块（thinking / text）
                 self.close_anthropic_thinking_block_if_open(&mut events);
                 if let Some(text_idx) = self.text_block_index.take() {
                     events.push(self.create_anthropic_content_block_stop(text_idx));
+                }
+
+                // Claude Code 需要至少一个 content block；若全程没有 text block，补一个空的 text block
+                if !self.anthropic_text_block_started {
+                    let idx = self.next_content_block_index;
+                    self.next_content_block_index += 1;
+                    self.anthropic_text_block_started = true;
+                    events.push(self.create_anthropic_content_block_start_text(idx));
+                    events.push(self.create_anthropic_content_block_stop(idx));
                 }
                 // message_delta
                 events.push(self.create_anthropic_message_delta());
