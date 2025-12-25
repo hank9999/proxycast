@@ -23,6 +23,7 @@ use axum::{
 use futures::StreamExt;
 
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
+use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
 use crate::converter::openai_to_antigravity::{
     convert_antigravity_to_openai_response, convert_openai_to_antigravity_with_context,
 };
@@ -35,8 +36,8 @@ use crate::providers::{
 };
 use crate::server::AppState;
 use crate::server_utils::{
-    build_anthropic_response, build_anthropic_stream_response, parse_cw_response, safe_truncate,
-    CWParsedResponse,
+    build_anthropic_response, build_anthropic_stream_response, parse_cw_response,
+    parse_cw_response_with_options, safe_truncate, CWParseOptions, CWParsedResponse,
 };
 use crate::streaming::{
     StreamConfig, StreamContext, StreamError, StreamFormat as StreamingFormat, StreamManager,
@@ -72,6 +73,13 @@ pub async fn call_provider_anthropic(
 
     match &credential.credential {
         CredentialData::KiroOAuth { creds_file_path } => {
+            // 是否启用 Claude Thinking（用于 Kiro 思考模式注入）
+            let thinking_enabled = request
+                .thinking
+                .as_ref()
+                .map(|t| t.thinking_type == "enabled" && t.budget_tokens.unwrap_or(1) > 0)
+                .unwrap_or(false);
+
             // 使用 TokenCacheService 获取有效 token
             let db = match &state.db {
                 Some(db) => db,
@@ -128,7 +136,10 @@ pub async fn call_provider_anthropic(
             kiro.credentials.access_token = Some(token);
             // 从源文件加载其他配置（region, profile_arn 等）
             let _ = kiro.load_credentials_from_path(creds_file_path).await;
-            let openai_request = convert_anthropic_to_openai(request);
+            let mut openai_request = convert_anthropic_to_openai(request);
+            if thinking_enabled {
+                ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+            }
             let resp = match kiro.call_api(&openai_request).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -150,7 +161,16 @@ pub async fn call_provider_anthropic(
                 match resp.bytes().await {
                     Ok(bytes) => {
                         let body = String::from_utf8_lossy(&bytes).to_string();
-                        let parsed = parse_cw_response(&body);
+                        let parsed = if thinking_enabled {
+                            parse_cw_response_with_options(
+                                &body,
+                                CWParseOptions {
+                                    extract_thinking: true,
+                                },
+                            )
+                        } else {
+                            parse_cw_response(&body)
+                        };
                         // 记录成功
                         let _ = state.pool_service.mark_healthy(
                             db,
@@ -212,7 +232,16 @@ pub async fn call_provider_anthropic(
                             match retry_resp.bytes().await {
                                 Ok(bytes) => {
                                     let body = String::from_utf8_lossy(&bytes).to_string();
-                                    let parsed = parse_cw_response(&body);
+                                    let parsed = if thinking_enabled {
+                                        parse_cw_response_with_options(
+                                            &body,
+                                            CWParseOptions {
+                                                extract_thinking: true,
+                                            },
+                                        )
+                                    } else {
+                                        parse_cw_response(&body)
+                                    };
                                     // 记录重试成功
                                     let _ = state.pool_service.mark_healthy(
                                         db,
@@ -358,6 +387,7 @@ pub async fn call_provider_anthropic(
                     let parsed = CWParsedResponse {
                         content: content.to_string(),
                         tool_calls: Vec::new(),
+                        thinking: None,
                         usage_credits: 0.0,
                         context_usage_percentage: 0.0,
                     };
@@ -410,6 +440,7 @@ pub async fn call_provider_anthropic(
                                     let parsed = CWParsedResponse {
                                         content: content.to_string(),
                                         tool_calls: Vec::new(),
+                                        thinking: None,
                                         usage_credits: 0.0,
                                         context_usage_percentage: 0.0,
                                     };

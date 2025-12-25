@@ -158,6 +158,10 @@ pub struct StreamConverter {
     tool_accumulators: HashMap<String, ToolCallAccumulator>,
     /// 下一个内容块索引（用于 Anthropic 格式）
     next_content_block_index: u32,
+    /// 当前打开的文本内容块索引（Anthropic）
+    text_block_index: Option<u32>,
+    /// 当前打开的 thinking 内容块索引（Anthropic）
+    thinking_block_index: Option<u32>,
     /// 是否已发送 message_start（用于 Anthropic 格式）
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
@@ -182,6 +186,8 @@ impl StreamConverter {
             model: String::new(),
             tool_accumulators: HashMap::new(),
             next_content_block_index: 0,
+            text_block_index: None,
+            thinking_block_index: None,
             message_started: false,
             accumulated_content: String::new(),
         }
@@ -218,6 +224,8 @@ impl StreamConverter {
         self.response_id = format!("chatcmpl-{}", Uuid::new_v4());
         self.tool_accumulators.clear();
         self.next_content_block_index = 0;
+        self.text_block_index = None;
+        self.thinking_block_index = None;
         self.message_started = false;
         self.accumulated_content.clear();
     }
@@ -311,21 +319,56 @@ impl StreamConverter {
                 // 累积内容
                 self.accumulated_content.push_str(text);
 
-                // 如果是第一个内容块，发送 content_block_start
-                if self.next_content_block_index == 0 {
-                    sse_events.push(self.create_anthropic_content_block_start_text(0));
-                    self.next_content_block_index = 1;
+                // 如果 thinking 块还开着，先关闭它再开始输出文本
+                if let Some(thinking_idx) = self.thinking_block_index.take() {
+                    sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
                 }
 
+                // 确保文本内容块已开始
+                let text_idx = if let Some(idx) = self.text_block_index {
+                    idx
+                } else {
+                    let idx = self.next_content_block_index;
+                    self.next_content_block_index += 1;
+                    self.text_block_index = Some(idx);
+                    sse_events.push(self.create_anthropic_content_block_start_text(idx));
+                    idx
+                };
+
                 // 发送 content_block_delta
-                sse_events.push(self.create_anthropic_text_delta(0, text));
+                sse_events.push(self.create_anthropic_text_delta(text_idx, text));
+            }
+            AwsEvent::Thinking { text, signature } => {
+                // 如果已经开始输出文本，则不要再插入 thinking（避免块交错导致协议不一致）
+                if self.text_block_index.is_some() {
+                    // 最小兼容：忽略后续 thinking
+                    return sse_events;
+                }
+
+                // 启动 thinking 内容块（若尚未启动）
+                let idx = if let Some(idx) = self.thinking_block_index {
+                    idx
+                } else {
+                    let idx = self.next_content_block_index;
+                    self.next_content_block_index += 1;
+                    self.thinking_block_index = Some(idx);
+                    sse_events.push(self.create_anthropic_content_block_start_thinking(
+                        idx,
+                        signature.as_deref(),
+                    ));
+                    idx
+                };
+
+                // thinking delta
+                sse_events.push(self.create_anthropic_thinking_delta(idx, text));
             }
             AwsEvent::ToolUseStart { id, name } => {
-                // 如果有文本内容块，先关闭它
-                if self.next_content_block_index > 0 && self.accumulated_content.is_empty() {
-                    // 没有文本内容，不需要关闭
-                } else if self.next_content_block_index > 0 {
-                    sse_events.push(self.create_anthropic_content_block_stop(0));
+                // 工具调用前，关闭可能打开的 thinking/text 内容块
+                if let Some(thinking_idx) = self.thinking_block_index.take() {
+                    sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
+                }
+                if let Some(text_idx) = self.text_block_index.take() {
+                    sse_events.push(self.create_anthropic_content_block_stop(text_idx));
                 }
 
                 let index = self.next_content_block_index;
@@ -396,6 +439,9 @@ impl StreamConverter {
                 self.accumulated_content.push_str(text);
                 // 发送 chunk
                 sse_events.push(self.create_openai_content_chunk(text, false));
+            }
+            AwsEvent::Thinking { .. } => {
+                // OpenAI SSE 目前不输出 thinking（可按需扩展为 reasoning_content）
             }
             AwsEvent::ToolUseStart { id, name } => {
                 let index = self.tool_accumulators.len() as u32;
@@ -579,6 +625,13 @@ impl StreamConverter {
         match self.target_format {
             StreamFormat::AnthropicSse => {
                 let mut events = Vec::new();
+                // 关闭尚未结束的内容块（thinking / text）
+                if let Some(thinking_idx) = self.thinking_block_index.take() {
+                    events.push(self.create_anthropic_content_block_stop(thinking_idx));
+                }
+                if let Some(text_idx) = self.text_block_index.take() {
+                    events.push(self.create_anthropic_content_block_stop(text_idx));
+                }
                 // message_delta
                 events.push(self.create_anthropic_message_delta());
                 // message_stop
@@ -664,6 +717,38 @@ impl StreamConverter {
             "delta": {
                 "type": "text_delta",
                 "text": text
+            }
+        });
+        format!("event: content_block_delta\ndata: {}\n\n", event)
+    }
+
+    fn create_anthropic_content_block_start_thinking(
+        &self,
+        index: u32,
+        signature: Option<&str>,
+    ) -> String {
+        let mut content_block = serde_json::json!({
+            "type": "thinking",
+            "thinking": ""
+        });
+        if let Some(sig) = signature {
+            content_block["signature"] = serde_json::json!(sig);
+        }
+        let event = serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        });
+        format!("event: content_block_start\ndata: {}\n\n", event)
+    }
+
+    fn create_anthropic_thinking_delta(&self, index: u32, thinking: &str) -> String {
+        let event = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "thinking_delta",
+                "thinking": thinking
             }
         });
         format!("event: content_block_delta\ndata: {}\n\n", event)

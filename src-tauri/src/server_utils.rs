@@ -9,14 +9,42 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use futures::stream;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+
+/// CodeWhisperer(Kiro) 响应解析选项
+#[derive(Debug, Clone, Copy)]
+pub struct CWParseOptions {
+    /// 是否从响应中提取思考内容（thinking）
+    ///
+    /// - 当客户端（如 Claude/Anthropic）显式启用 thinking 时，建议打开
+    /// - 默认关闭以避免误解析（例如模型解释 `<thinking>` 标签时）
+    pub extract_thinking: bool,
+}
+
+impl Default for CWParseOptions {
+    fn default() -> Self {
+        Self {
+            extract_thinking: false,
+        }
+    }
+}
+
+/// 解析到的思考内容（thinking）
+#[derive(Debug, Clone)]
+pub struct CWThinkingContent {
+    pub text: String,
+    pub signature: Option<String>,
+}
 
 /// CodeWhisperer 响应解析结果
 #[derive(Debug, Default)]
 pub struct CWParsedResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    pub thinking: Option<CWThinkingContent>,
     pub usage_credits: f64,
     pub context_usage_percentage: f64,
 }
@@ -33,6 +61,9 @@ impl CWParsedResponse {
     pub fn estimate_tokens(&self) -> (u32, u32) {
         // 估算 output tokens: 基于响应内容长度 (约 4 字符 = 1 token)
         let mut output_tokens: u32 = (self.content.len() / 4) as u32;
+        if let Some(thinking) = &self.thinking {
+            output_tokens += (thinking.text.len() / 4) as u32;
+        }
         for tc in &self.tool_calls {
             output_tokens += (tc.function.arguments.len() / 4) as u32;
         }
@@ -76,17 +107,26 @@ pub fn message_content_len(content: &MessageContent) -> usize {
 ///
 /// AWS Event Stream 是二进制格式，JSON payload 嵌入在二进制头部之间
 pub fn parse_cw_response(body: &str) -> CWParsedResponse {
+    parse_cw_response_with_options(body, CWParseOptions::default())
+}
+
+/// 解析 CodeWhisperer/Kiro 响应（可选提取 thinking）
+pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CWParsedResponse {
     let mut result = CWParsedResponse::default();
     // 使用 HashMap 来跟踪多个并发的 tool calls
     // key: toolUseId, value: (name, input_accumulated)
     let mut tool_map: HashMap<String, (String, String)> = HashMap::new();
+
+    // thinking 内容（可选）
+    let mut thinking_text = String::new();
+    let mut thinking_signature: Option<String> = None;
 
     // 将字符串转换为字节，因为 AWS Event Stream 包含二进制数据
     let bytes = body.as_bytes();
 
     // 搜索所有 JSON 对象的模式
     // AWS Event Stream 格式: [binary headers]{"content":"..."}[binary trailer]
-    let json_patterns: &[&[u8]] = &[
+    let mut json_patterns: Vec<&[u8]> = vec![
         b"{\"content\":",
         b"{\"name\":",
         b"{\"input\":",
@@ -96,13 +136,17 @@ pub fn parse_cw_response(body: &str) -> CWParsedResponse {
         b"{\"unit\":",                   // meteringEvent
         b"{\"contextUsagePercentage\":", // contextUsageEvent
     ];
+    if options.extract_thinking {
+        // Kiro 官方 reasoning/thinking 事件
+        json_patterns.push(b"{\"reasoningContentEvent\":");
+    }
 
     let mut pos = 0;
     while pos < bytes.len() {
         // 找到下一个 JSON 对象的开始
         let mut next_start: Option<usize> = None;
 
-        for pattern in json_patterns {
+        for pattern in &json_patterns {
             if let Some(idx) = find_subsequence(&bytes[pos..], pattern) {
                 let abs_pos = pos + idx;
                 if next_start.is_none_or(|start| abs_pos < start) {
@@ -119,6 +163,23 @@ pub fn parse_cw_response(body: &str) -> CWParsedResponse {
         // 从 start 位置提取完整的 JSON 对象
         if let Some(json_str) = extract_json_from_bytes(&bytes[start..]) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                // 处理 reasoningContentEvent: {"reasoningContentEvent":{"text":"...","signature":"..."}}
+                if options.extract_thinking {
+                    if let Some(re) = value.get("reasoningContentEvent") {
+                        if let Some(text) = re.get("text").and_then(|v| v.as_str()) {
+                            thinking_text.push_str(text);
+                        }
+                        if let Some(sig) = re.get("signature").and_then(|v| v.as_str()) {
+                            if !sig.trim().is_empty() {
+                                thinking_signature = Some(sig.to_string());
+                            }
+                        }
+                        // reasoning 事件不应进入 content
+                        pos = start + json_str.len();
+                        continue;
+                    }
+                }
+
                 // 处理 content 事件
                 if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                     // 跳过 followupPrompt
@@ -204,10 +265,82 @@ pub fn parse_cw_response(body: &str) -> CWParsedResponse {
         }
     }
 
+    // 如果启用了 thinking，尝试从 content 中提取 <thinking>...</thinking> 标签作为回退
+    if options.extract_thinking {
+        let (cleaned, extracted) = extract_thinking_from_content(&result.content);
+        result.content = cleaned;
+        if !extracted.is_empty() {
+            thinking_text.push_str(&extracted);
+        }
+
+        let final_thinking = thinking_text;
+        if !final_thinking.trim().is_empty() {
+            let signature = thinking_signature.or_else(|| {
+                let sig = generate_thinking_signature(&final_thinking);
+                if sig.trim().is_empty() {
+                    None
+                } else {
+                    Some(sig)
+                }
+            });
+
+            result.thinking = Some(CWThinkingContent {
+                text: final_thinking,
+                signature,
+            });
+        }
+    }
+
     // 解析 bracket 格式的 tool calls: [Called xxx with args: {...}]
     parse_bracket_tool_calls(&mut result);
 
     result
+}
+
+/// 生成 thinking 的 signature（SHA256 + Base64）
+fn generate_thinking_signature(thinking_content: &str) -> String {
+    if thinking_content.trim().is_empty() {
+        return String::new();
+    }
+    let hash = Sha256::digest(thinking_content.as_bytes());
+    BASE64_STANDARD.encode(hash)
+}
+
+/// 从 content 中提取 `<thinking>...</thinking>` 标签内容
+///
+/// 返回：(cleaned_content, extracted_thinking)
+fn extract_thinking_from_content(content: &str) -> (String, String) {
+    let start_tag = "<thinking>";
+    let end_tag = "</thinking>";
+
+    let mut cleaned = String::with_capacity(content.len());
+    let mut thinking = String::new();
+
+    let mut remaining = content;
+    loop {
+        let Some(start) = remaining.find(start_tag) else {
+            cleaned.push_str(remaining);
+            break;
+        };
+
+        let (before, after_start_with_tag) = remaining.split_at(start);
+        cleaned.push_str(before);
+
+        let after_start = &after_start_with_tag[start_tag.len()..];
+        let Some(end) = after_start.find(end_tag) else {
+            // 没有闭合标签：认为不是可解析的 thinking，保留原文
+            cleaned.push_str(start_tag);
+            cleaned.push_str(after_start);
+            break;
+        };
+
+        let (think_part, after_end_with_tag) = after_start.split_at(end);
+        thinking.push_str(think_part);
+
+        remaining = &after_end_with_tag[end_tag.len()..];
+    }
+
+    (cleaned, thinking)
 }
 
 /// 在字节数组中查找子序列
@@ -327,6 +460,18 @@ pub fn build_anthropic_response(model: &str, parsed: &CWParsedResponse) -> Respo
     let has_tool_calls = !parsed.tool_calls.is_empty();
     let mut content_array: Vec<serde_json::Value> = Vec::new();
 
+    // thinking 内容（如果启用并成功解析）
+    if let Some(thinking) = &parsed.thinking {
+        let mut block = serde_json::json!({
+            "type": "thinking",
+            "thinking": thinking.text,
+        });
+        if let Some(sig) = &thinking.signature {
+            block["signature"] = serde_json::json!(sig);
+        }
+        content_array.push(block);
+    }
+
     if !parsed.content.is_empty() {
         content_array.push(serde_json::json!({
             "type": "text",
@@ -351,6 +496,9 @@ pub fn build_anthropic_response(model: &str, parsed: &CWParsedResponse) -> Respo
 
     // 估算 output tokens: 基于响应内容长度 (约 4 字符 = 1 token)
     let mut output_tokens: u32 = (parsed.content.len() / 4) as u32;
+    if let Some(thinking) = &parsed.thinking {
+        output_tokens += (thinking.text.len() / 4) as u32;
+    }
     for tc in &parsed.tool_calls {
         output_tokens += (tc.function.arguments.len() / 4) as u32;
     }
@@ -381,9 +529,13 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     let model = model.to_string();
     let content = parsed.content.clone();
     let tool_calls = parsed.tool_calls.clone();
+    let thinking = parsed.thinking.clone();
 
     // 估算 output tokens: 基于响应内容长度 (约 4 字符 = 1 token)
     let mut output_tokens: u32 = (parsed.content.len() / 4) as u32;
+    if let Some(thinking) = &thinking {
+        output_tokens += (thinking.text.len() / 4) as u32;
+    }
     for tc in &parsed.tool_calls {
         output_tokens += (tc.function.arguments.len() / 4) as u32;
     }
@@ -410,6 +562,44 @@ pub fn build_anthropic_stream_response(model: &str, parsed: &CWParsedResponse) -
     events.push(format!("event: message_start\ndata: {message_start}\n\n"));
 
     let mut block_index = 0;
+
+    // 1.5 thinking 内容块（可选）
+    if let Some(thinking) = &thinking {
+        // content_block_start
+        let mut content_block = serde_json::json!({"type": "thinking", "thinking": ""});
+        if let Some(sig) = &thinking.signature {
+            content_block["signature"] = serde_json::json!(sig);
+        }
+        let block_start = serde_json::json!({
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": content_block
+        });
+        events.push(format!(
+            "event: content_block_start\ndata: {block_start}\n\n"
+        ));
+
+        if !thinking.text.is_empty() {
+            // content_block_delta
+            let block_delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "thinking_delta", "thinking": thinking.text}
+            });
+            events.push(format!(
+                "event: content_block_delta\ndata: {block_delta}\n\n"
+            ));
+        }
+
+        // content_block_stop
+        let block_stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": block_index
+        });
+        events.push(format!("event: content_block_stop\ndata: {block_stop}\n\n"));
+
+        block_index += 1;
+    }
 
     // 2. 文本内容块 - 即使为空也要发送，Claude Code 需要至少一个 content block
     // content_block_start

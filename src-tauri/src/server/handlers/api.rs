@@ -24,19 +24,20 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
+use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
 use crate::flow_monitor::{
     ClientInfo, FlowError, FlowErrorType, FlowMetadata, FlowType, InterceptAction, InterceptType,
     LLMFlow, LLMRequest, LLMResponse, Message, MessageContent, MessageRole, RequestParameters,
     RoutingInfo, TokenUsage,
 };
-use crate::models::anthropic::AnthropicMessagesRequest;
+use crate::models::anthropic::{AnthropicMessagesRequest, AnthropicThinkingConfig};
 use crate::models::openai::ChatCompletionRequest;
 use crate::processor::RequestContext;
 use crate::server::client_detector::ClientType;
 use crate::server::{record_request_telemetry, record_token_usage, AppState};
 use crate::server_utils::{
     build_anthropic_response, build_anthropic_stream_response, message_content_len,
-    parse_cw_response, safe_truncate,
+    parse_cw_response, parse_cw_response_with_options, safe_truncate, CWParseOptions,
 };
 use crate::streaming::StreamFormat as StreamingFormat;
 use crate::ProviderType;
@@ -1429,6 +1430,27 @@ pub async fn anthropic_messages(
     // 创建请求上下文
     let mut ctx = RequestContext::new(request.model.clone()).with_stream(request.stream);
 
+    // Claude Code 等客户端可能通过 Anthropic-Beta header 启用 thinking
+    // 示例：Anthropic-Beta: interleaved-thinking-2025-05-14
+    if request.thinking.is_none() {
+        if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+            if beta.contains("interleaved-thinking") {
+                request.thinking = Some(AnthropicThinkingConfig {
+                    thinking_type: "enabled".to_string(),
+                    // budget_tokens 不同客户端差异较大，这里给一个保守默认值
+                    budget_tokens: Some(24_000),
+                });
+                state.logs.write().await.add(
+                    "info",
+                    &format!(
+                        "[THINKING] request_id={} enabled via Anthropic-Beta header: {}",
+                        ctx.request_id, beta
+                    ),
+                );
+            }
+        }
+    }
+
     // 详细记录请求信息
     let msg_count = request.messages.len();
     let has_tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0);
@@ -1819,7 +1841,17 @@ pub async fn anthropic_messages(
     }
 
     // 转换为 OpenAI 格式
-    let openai_request = convert_anthropic_to_openai(&request);
+    let thinking_enabled = request
+        .thinking
+        .as_ref()
+        .map(|t| t.thinking_type == "enabled" && t.budget_tokens.unwrap_or(1) > 0)
+        .unwrap_or(false);
+
+    let mut openai_request = convert_anthropic_to_openai(&request);
+    // Kiro 思考模式需要注入 special tags（仅在客户端启用 thinking 时注入）
+    if thinking_enabled {
+        ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+    }
 
     // 记录转换后的请求信息
     state.logs.write().await.add(
@@ -1872,7 +1904,16 @@ pub async fn anthropic_messages(
                             .await
                             .add("debug", &format!("[RESP] Body preview: {preview}"));
 
-                        let parsed = parse_cw_response(&body);
+                        let parsed = if thinking_enabled {
+                            parse_cw_response_with_options(
+                                &body,
+                                CWParseOptions {
+                                    extract_thinking: true,
+                                },
+                            )
+                        } else {
+                            parse_cw_response(&body)
+                        };
 
                         // 详细记录解析结果
                         state.logs.write().await.add(
@@ -2084,7 +2125,16 @@ pub async fn anthropic_messages(
                                     match retry_resp.bytes().await {
                                         Ok(bytes) => {
                                             let body = String::from_utf8_lossy(&bytes).to_string();
-                                            let parsed = parse_cw_response(&body);
+                                            let parsed = if thinking_enabled {
+                                                parse_cw_response_with_options(
+                                                    &body,
+                                                    CWParseOptions {
+                                                        extract_thinking: true,
+                                                    },
+                                                )
+                                            } else {
+                                                parse_cw_response(&body)
+                                            };
                                             state.logs.write().await.add(
                                                 "info",
                                                 &format!(

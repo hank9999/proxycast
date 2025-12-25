@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
+use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
 use crate::converter::openai_to_antigravity::{
     convert_antigravity_to_openai_response, convert_openai_to_antigravity_with_context,
 };
@@ -28,7 +29,7 @@ use crate::providers::{
     AntigravityProvider, ClaudeCustomProvider, KiroProvider, OpenAICustomProvider,
 };
 use crate::server::AppState;
-use crate::server_utils::parse_cw_response;
+use crate::server_utils::{parse_cw_response, parse_cw_response_with_options, CWParseOptions};
 use crate::websocket::{
     WsApiRequest, WsApiResponse, WsEndpoint, WsError, WsFlowEvent, WsMessage as WsProtoMessage,
 };
@@ -616,24 +617,55 @@ async fn handle_ws_anthropic_messages(
         let kiro = state.kiro.read().await;
 
         // 转换为 OpenAI 格式
-        let openai_request = convert_anthropic_to_openai(&request);
+        let thinking_enabled = request
+            .thinking
+            .as_ref()
+            .map(|t| t.thinking_type == "enabled" && t.budget_tokens.unwrap_or(1) > 0)
+            .unwrap_or(false);
+
+        let mut openai_request = convert_anthropic_to_openai(&request);
+        if thinking_enabled {
+            ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+        }
 
         match kiro.call_api(&openai_request).await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.text().await {
                         Ok(body) => {
-                            let parsed = parse_cw_response(&body);
+                            let parsed = if thinking_enabled {
+                                parse_cw_response_with_options(
+                                    &body,
+                                    CWParseOptions {
+                                        extract_thinking: true,
+                                    },
+                                )
+                            } else {
+                                parse_cw_response(&body)
+                            };
 
                             // 转换为 Anthropic 格式响应
+                            let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                            if let Some(thinking) = &parsed.thinking {
+                                let mut block = serde_json::json!({
+                                    "type": "thinking",
+                                    "thinking": thinking.text,
+                                });
+                                if let Some(sig) = &thinking.signature {
+                                    block["signature"] = serde_json::json!(sig);
+                                }
+                                content_blocks.push(block);
+                            }
+                            content_blocks.push(serde_json::json!({
+                                "type": "text",
+                                "text": parsed.content
+                            }));
+
                             let response = serde_json::json!({
                                 "id": format!("msg_{}", uuid::Uuid::new_v4()),
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{
-                                    "type": "text",
-                                    "text": parsed.content
-                                }],
+                                "content": content_blocks,
                                 "model": request.model,
                                 "stop_reason": "end_turn",
                                 "usage": {

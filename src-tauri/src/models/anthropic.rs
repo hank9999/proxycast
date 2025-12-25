@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 pub enum AnthropicContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    /// 思考内容块（Claude Thinking）
+    ///
+    /// 当请求启用 thinking 后，Claude 会在响应中返回该类型内容块。
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -50,6 +59,12 @@ pub struct AnthropicMessagesRequest {
     pub messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// 思考模式（Claude Thinking）
+    ///
+    /// 示例：
+    /// {"type":"enabled","budget_tokens":24000}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<AnthropicThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +93,17 @@ pub struct AnthropicMessagesResponse {
     pub model: String,
     pub stop_reason: Option<String>,
     pub usage: AnthropicUsage,
+}
+
+/// Anthropic 请求的 thinking 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicThinkingConfig {
+    /// "enabled" / "disabled"
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    /// thinking 预算（单位：tokens），不同客户端可能用不同值
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 // Streaming events
@@ -118,8 +144,14 @@ pub struct AnthropicMessageStart {
 pub enum AnthropicDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    /// 思考增量（thinking）
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    /// 签名增量（可选，部分实现会单独流式传输）
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

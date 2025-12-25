@@ -7,6 +7,7 @@ use crate::config::{
     FileWatcher, HotReloadManager, ReloadResult,
 };
 use crate::converter::anthropic_to_openai::convert_anthropic_to_openai;
+use crate::converter::kiro_thinking::{ensure_kiro_thinking_tags, DEFAULT_MAX_THINKING_LENGTH};
 use crate::credential::CredentialSyncService;
 use crate::database::dao::provider_pool::ProviderPoolDao;
 use crate::database::DbConnection;
@@ -26,7 +27,7 @@ use crate::providers::openai_custom::OpenAICustomProvider;
 use crate::providers::qwen::QwenProvider;
 use crate::server_utils::{
     build_anthropic_response, build_anthropic_stream_response, build_gemini_native_request, health,
-    models, parse_cw_response,
+    models, parse_cw_response, parse_cw_response_with_options, CWParseOptions,
 };
 use crate::services::kiro_event_service::KiroEventService;
 use crate::services::provider_pool_service::ProviderPoolService;
@@ -1762,7 +1763,16 @@ async fn anthropic_messages_internal(
         }
     }
 
-    let openai_request = convert_anthropic_to_openai(request);
+    let thinking_enabled = request
+        .thinking
+        .as_ref()
+        .map(|t| t.thinking_type == "enabled" && t.budget_tokens.unwrap_or(1) > 0)
+        .unwrap_or(false);
+
+    let mut openai_request = convert_anthropic_to_openai(request);
+    if thinking_enabled {
+        ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
+    }
     let kiro = state.kiro.read().await;
 
     match kiro.call_api(&openai_request).await {
@@ -1772,7 +1782,16 @@ async fn anthropic_messages_internal(
                 match resp.bytes().await {
                     Ok(bytes) => {
                         let body = String::from_utf8_lossy(&bytes).to_string();
-                        let parsed = parse_cw_response(&body);
+                        let parsed = if thinking_enabled {
+                            parse_cw_response_with_options(
+                                &body,
+                                CWParseOptions {
+                                    extract_thinking: true,
+                                },
+                            )
+                        } else {
+                            parse_cw_response(&body)
+                        };
                         if request.stream {
                             build_anthropic_stream_response(&request.model, &parsed)
                         } else {
