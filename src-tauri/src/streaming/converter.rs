@@ -15,6 +15,281 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KiroThinkingTagParseState {
+    /// 尚不确定是否需要解析 `<thinking>` 标签
+    Armed,
+    /// 已确定这是 Kiro thinking 标签输出，开始解析并拆分 thinking/content
+    Enabled,
+    /// 明确不解析（当作普通文本）
+    Disabled,
+}
+
+impl Default for KiroThinkingTagParseState {
+    fn default() -> Self {
+        Self::Armed
+    }
+}
+
+/// Kiro `<thinking>...</thinking>` 标签增量解析器
+///
+/// 背景：Kiro 在开启 thinking 模式时，理想情况下会通过 `reasoningContentEvent`
+/// 返回思考增量。但在部分场景下，思考内容会混入 `assistantResponseEvent` 的 `content`
+/// 字段中，以 `<thinking>...</thinking>` 标签包裹。
+///
+/// 本解析器用于在 **没有** `reasoningContentEvent` 的情况下，把标签内文本拆分为
+/// thinking 段落，从而让上层可以回调到“思考块”里。
+///
+/// 设计目标：
+/// - 增量解析：标签可能跨多个 chunk/事件分段
+/// - 低误判：仅当响应以（可选空白后）`<thinking>` 开头时才启用解析
+/// - 最小兼容：默认只解析第一个 thinking 标签块，避免后续内容里出现字面量标签导致误拆
+#[derive(Debug, Clone)]
+struct KiroThinkingTagParser {
+    state: KiroThinkingTagParseState,
+    buffer: String,
+    in_thinking: bool,
+    closed_once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KiroTextSegmentKind {
+    Content,
+    Thinking,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KiroTextSegment {
+    kind: KiroTextSegmentKind,
+    text: String,
+}
+
+impl KiroThinkingTagParser {
+    const OPEN_TAG: &'static str = "<thinking>";
+    const CLOSE_TAG: &'static str = "</thinking>";
+
+    fn new() -> Self {
+        Self {
+            state: KiroThinkingTagParseState::Armed,
+            buffer: String::new(),
+            in_thinking: false,
+            closed_once: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = KiroThinkingTagParseState::Armed;
+        self.buffer.clear();
+        self.in_thinking = false;
+        self.closed_once = false;
+    }
+
+    fn disable(&mut self) {
+        self.state = KiroThinkingTagParseState::Disabled;
+        self.in_thinking = false;
+        self.closed_once = false;
+        self.buffer.clear();
+    }
+
+    fn flush_finish(&mut self) -> Vec<KiroTextSegment> {
+        match self.state {
+            KiroThinkingTagParseState::Armed | KiroThinkingTagParseState::Disabled => {
+                let text = std::mem::take(&mut self.buffer);
+                if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![KiroTextSegment {
+                        kind: KiroTextSegmentKind::Content,
+                        text,
+                    }]
+                }
+            }
+            KiroThinkingTagParseState::Enabled => self.parse_enabled(false),
+        }
+    }
+
+    fn push_and_parse(&mut self, incoming: &str) -> Vec<KiroTextSegment> {
+        if incoming.is_empty() && self.buffer.is_empty() {
+            return vec![];
+        }
+
+        match self.state {
+            KiroThinkingTagParseState::Disabled => {
+                if !self.buffer.is_empty() {
+                    let mut out = vec![KiroTextSegment {
+                        kind: KiroTextSegmentKind::Content,
+                        text: std::mem::take(&mut self.buffer),
+                    }];
+                    if !incoming.is_empty() {
+                        out.push(KiroTextSegment {
+                            kind: KiroTextSegmentKind::Content,
+                            text: incoming.to_string(),
+                        });
+                    }
+                    out
+                } else if incoming.is_empty() {
+                    vec![]
+                } else {
+                    vec![KiroTextSegment {
+                        kind: KiroTextSegmentKind::Content,
+                        text: incoming.to_string(),
+                    }]
+                }
+            }
+            KiroThinkingTagParseState::Armed => {
+                self.buffer.push_str(incoming);
+                self.try_arm_and_parse()
+            }
+            KiroThinkingTagParseState::Enabled => {
+                self.buffer.push_str(incoming);
+                self.parse_enabled(true)
+            }
+        }
+    }
+
+    fn try_arm_and_parse(&mut self) -> Vec<KiroTextSegment> {
+        // 仅当响应以（可选空白后）`<thinking>` 开头时，才启用标签解析。
+        // 否则一律当作普通文本，避免误把用户/模型的字面量 `<thinking>` 当成思考块。
+        let first_non_ws = self
+            .buffer
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(i, _)| i);
+
+        let Some(idx) = first_non_ws else {
+            // 全是空白：直接输出，避免缓冲无限增长
+            let text = std::mem::take(&mut self.buffer);
+            if text.is_empty() {
+                return vec![];
+            }
+            return vec![KiroTextSegment {
+                kind: KiroTextSegmentKind::Content,
+                text,
+            }];
+        };
+
+        let tail = &self.buffer[idx..];
+        if tail.starts_with(Self::OPEN_TAG) {
+            self.state = KiroThinkingTagParseState::Enabled;
+            self.parse_enabled(true)
+        } else if Self::OPEN_TAG.starts_with(tail) {
+            // `<thinking>` 标签可能被切成多个 chunk（例如 `<think` + `ing>`），继续等待
+            vec![]
+        } else {
+            // 不是以 `<thinking>` 开头：禁用解析并全部按 content 输出
+            self.state = KiroThinkingTagParseState::Disabled;
+            let text = std::mem::take(&mut self.buffer);
+            vec![KiroTextSegment {
+                kind: KiroTextSegmentKind::Content,
+                text,
+            }]
+        }
+    }
+
+    fn parse_enabled(&mut self, keep_partial_tag_suffix: bool) -> Vec<KiroTextSegment> {
+        if self.closed_once {
+            // 默认只解析第一个 `<thinking>...</thinking>`，后续全部当作普通内容
+            let text = std::mem::take(&mut self.buffer);
+            if text.is_empty() {
+                return vec![];
+            }
+            return vec![KiroTextSegment {
+                kind: KiroTextSegmentKind::Content,
+                text,
+            }];
+        }
+
+        let mut out = Vec::new();
+        loop {
+            if self.buffer.is_empty() {
+                break;
+            }
+
+            if self.in_thinking {
+                if let Some(pos) = self.buffer.find(Self::CLOSE_TAG) {
+                    if pos > 0 {
+                        out.push(KiroTextSegment {
+                            kind: KiroTextSegmentKind::Thinking,
+                            text: self.buffer[..pos].to_string(),
+                        });
+                    }
+                    self.buffer.drain(..pos + Self::CLOSE_TAG.len());
+                    self.in_thinking = false;
+                    self.closed_once = true;
+                    // 关闭后立即降级为普通文本，避免后续误判
+                    self.state = KiroThinkingTagParseState::Disabled;
+                    continue;
+                }
+
+                if keep_partial_tag_suffix {
+                    let keep = longest_suffix_prefix(&self.buffer, Self::CLOSE_TAG);
+                    if self.buffer.len() > keep {
+                        let split_at = self.buffer.len() - keep;
+                        out.push(KiroTextSegment {
+                            kind: KiroTextSegmentKind::Thinking,
+                            text: self.buffer[..split_at].to_string(),
+                        });
+                        self.buffer.drain(..split_at);
+                    }
+                } else {
+                    out.push(KiroTextSegment {
+                        kind: KiroTextSegmentKind::Thinking,
+                        text: std::mem::take(&mut self.buffer),
+                    });
+                }
+                break;
+            } else if let Some(pos) = self.buffer.find(Self::OPEN_TAG) {
+                if pos > 0 {
+                    out.push(KiroTextSegment {
+                        kind: KiroTextSegmentKind::Content,
+                        text: self.buffer[..pos].to_string(),
+                    });
+                }
+                self.buffer.drain(..pos + Self::OPEN_TAG.len());
+                self.in_thinking = true;
+                continue;
+            } else {
+                if keep_partial_tag_suffix {
+                    let keep = longest_suffix_prefix(&self.buffer, Self::OPEN_TAG);
+                    if self.buffer.len() > keep {
+                        let split_at = self.buffer.len() - keep;
+                        out.push(KiroTextSegment {
+                            kind: KiroTextSegmentKind::Content,
+                            text: self.buffer[..split_at].to_string(),
+                        });
+                        self.buffer.drain(..split_at);
+                    }
+                } else {
+                    out.push(KiroTextSegment {
+                        kind: KiroTextSegmentKind::Content,
+                        text: std::mem::take(&mut self.buffer),
+                    });
+                }
+                break;
+            }
+        }
+
+        out.into_iter().filter(|s| !s.text.is_empty()).collect()
+    }
+}
+
+fn longest_suffix_prefix(haystack: &str, needle: &str) -> usize {
+    if haystack.is_empty() || needle.is_empty() {
+        return 0;
+    }
+    let max = haystack.len().min(needle.len().saturating_sub(1));
+    if max == 0 {
+        return 0;
+    }
+    for len in (1..=max).rev() {
+        let start = haystack.len() - len;
+        if haystack.is_char_boundary(start) && needle.starts_with(&haystack[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
 /// 流式格式类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamFormat {
@@ -166,6 +441,12 @@ pub struct StreamConverter {
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
     accumulated_content: String,
+    /// Kiro `<thinking>` 标签回退解析器（用于 assistantResponseEvent 混入 thinking 的场景）
+    kiro_thinking_tag_parser: KiroThinkingTagParser,
+    /// 是否已见到 Kiro 官方 reasoningContentEvent
+    ///
+    /// 一旦出现该事件，则优先以其为准，禁用 `<thinking>` 标签回退解析，避免重复/冲突。
+    kiro_seen_reasoning_event: bool,
 }
 
 impl StreamConverter {
@@ -190,6 +471,8 @@ impl StreamConverter {
             thinking_block_index: None,
             message_started: false,
             accumulated_content: String::new(),
+            kiro_thinking_tag_parser: KiroThinkingTagParser::new(),
+            kiro_seen_reasoning_event: false,
         }
     }
 
@@ -228,6 +511,8 @@ impl StreamConverter {
         self.thinking_block_index = None;
         self.message_started = false;
         self.accumulated_content.clear();
+        self.kiro_thinking_tag_parser.reset();
+        self.kiro_seen_reasoning_event = false;
     }
 
     /// 转换 chunk
@@ -266,6 +551,10 @@ impl StreamConverter {
                 events.extend(self.convert_aws_event(&aws_event));
             }
         }
+
+        // Kiro `<thinking>` 标签解析可能会缓存部分内容（例如标签被切块）
+        // 在流结束时尽量把剩余缓冲区输出，避免内容丢失。
+        events.extend(self.flush_kiro_thinking_tag_buffer());
 
         // 生成结束事件
         events.extend(self.generate_end_events());
@@ -316,29 +605,25 @@ impl StreamConverter {
 
         match event {
             AwsEvent::Content { text } => {
-                // 累积内容
-                self.accumulated_content.push_str(text);
-
-                // 如果 thinking 块还开着，先关闭它再开始输出文本
-                if let Some(thinking_idx) = self.thinking_block_index.take() {
-                    sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
+                let segments = self.parse_kiro_thinking_tags_if_needed(text);
+                for seg in segments {
+                    match seg.kind {
+                        KiroTextSegmentKind::Content => {
+                            self.emit_aws_content_as_anthropic(&mut sse_events, &seg.text);
+                        }
+                        KiroTextSegmentKind::Thinking => {
+                            // signature 只在 reasoningContentEvent 中才可能存在，这里回退解析统一视为 None
+                            self.emit_aws_thinking_as_anthropic(&mut sse_events, &seg.text, None);
+                        }
+                    }
                 }
-
-                // 确保文本内容块已开始
-                let text_idx = if let Some(idx) = self.text_block_index {
-                    idx
-                } else {
-                    let idx = self.next_content_block_index;
-                    self.next_content_block_index += 1;
-                    self.text_block_index = Some(idx);
-                    sse_events.push(self.create_anthropic_content_block_start_text(idx));
-                    idx
-                };
-
-                // 发送 content_block_delta
-                sse_events.push(self.create_anthropic_text_delta(text_idx, text));
             }
             AwsEvent::Thinking { text, signature } => {
+                // Kiro 官方 reasoningContentEvent 优先：先输出已缓存的 content，再禁用 `<thinking>` 标签回退解析
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
+                self.kiro_seen_reasoning_event = true;
+                self.kiro_thinking_tag_parser.disable();
+
                 // 如果已经开始输出文本，则不要再插入 thinking（避免块交错导致协议不一致）
                 if self.text_block_index.is_some() {
                     // 最小兼容：忽略后续 thinking
@@ -346,23 +631,27 @@ impl StreamConverter {
                 }
 
                 // 启动 thinking 内容块（若尚未启动）
-                let idx = if let Some(idx) = self.thinking_block_index {
-                    idx
-                } else {
-                    let idx = self.next_content_block_index;
-                    self.next_content_block_index += 1;
-                    self.thinking_block_index = Some(idx);
-                    sse_events.push(self.create_anthropic_content_block_start_thinking(
-                        idx,
-                        signature.as_deref(),
-                    ));
-                    idx
-                };
+                let idx =
+                    if let Some(idx) = self.thinking_block_index {
+                        idx
+                    } else {
+                        let idx = self.next_content_block_index;
+                        self.next_content_block_index += 1;
+                        self.thinking_block_index = Some(idx);
+                        sse_events.push(self.create_anthropic_content_block_start_thinking(
+                            idx,
+                            signature.as_deref(),
+                        ));
+                        idx
+                    };
 
                 // thinking delta
                 sse_events.push(self.create_anthropic_thinking_delta(idx, text));
             }
             AwsEvent::ToolUseStart { id, name } => {
+                // 工具调用前先清空可能缓存的 `<thinking>` 标签内容，避免顺序错乱
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
+
                 // 工具调用前，关闭可能打开的 thinking/text 内容块
                 if let Some(thinking_idx) = self.thinking_block_index.take() {
                     sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
@@ -390,6 +679,7 @@ impl StreamConverter {
                 sse_events.push(self.create_anthropic_content_block_start_tool(index, id, name));
             }
             AwsEvent::ToolUseInput { id, input } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 if let Some(acc) = self.tool_accumulators.get_mut(id) {
                     acc.input.push_str(input);
                 }
@@ -399,12 +689,14 @@ impl StreamConverter {
                 }
             }
             AwsEvent::ToolUseStop { id } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 if let Some(acc) = self.tool_accumulators.remove(id) {
                     // 发送 content_block_stop
                     sse_events.push(self.create_anthropic_content_block_stop(acc.index));
                 }
             }
             AwsEvent::Stop => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // 关闭所有未关闭的内容块
                 if self.next_content_block_index > 0 && !self.accumulated_content.is_empty() {
                     sse_events.push(self.create_anthropic_content_block_stop(0));
@@ -415,6 +707,7 @@ impl StreamConverter {
                 credits,
                 context_percentage,
             } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // Usage 信息在 message_delta 中发送
                 // 这里暂时忽略，在 finish() 中处理
                 let _ = (credits, context_percentage);
@@ -435,16 +728,31 @@ impl StreamConverter {
 
         match event {
             AwsEvent::Content { text } => {
-                // 累积内容
-                self.accumulated_content.push_str(text);
-                // 发送 chunk
-                sse_events.push(self.create_openai_content_chunk(text, false));
+                let segments = self.parse_kiro_thinking_tags_if_needed(text);
+                for seg in segments {
+                    match seg.kind {
+                        KiroTextSegmentKind::Content => {
+                            self.accumulated_content.push_str(&seg.text);
+                            sse_events.push(self.create_openai_content_chunk(&seg.text, false));
+                        }
+                        KiroTextSegmentKind::Thinking => {
+                            // OpenAI 协议扩展：使用 reasoning_content 输出思考内容
+                            sse_events.push(self.create_openai_reasoning_chunk(&seg.text, false));
+                        }
+                    }
+                }
             }
             AwsEvent::Thinking { text, .. } => {
+                // Kiro 官方 reasoningContentEvent 优先：先输出已缓存的 content，再禁用 `<thinking>` 标签回退解析
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
+                self.kiro_seen_reasoning_event = true;
+                self.kiro_thinking_tag_parser.disable();
+
                 // OpenAI 协议扩展：使用 reasoning_content 输出思考内容
                 sse_events.push(self.create_openai_reasoning_chunk(text, false));
             }
             AwsEvent::ToolUseStart { id, name } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 let index = self.tool_accumulators.len() as u32;
                 self.tool_accumulators.insert(
                     id.clone(),
@@ -460,6 +768,7 @@ impl StreamConverter {
                 sse_events.push(self.create_openai_tool_call_chunk(index, id, name, "", true));
             }
             AwsEvent::ToolUseInput { id, input } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 let (index, tool_id, tool_name) =
                     if let Some(acc) = self.tool_accumulators.get_mut(id) {
                         acc.input.push_str(input);
@@ -473,20 +782,145 @@ impl StreamConverter {
                 );
             }
             AwsEvent::ToolUseStop { id } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // OpenAI 格式不需要显式的工具调用结束事件
                 self.tool_accumulators.remove(id);
             }
             AwsEvent::Stop => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // 结束事件在 finish() 中处理
             }
             AwsEvent::Usage { .. }
             | AwsEvent::FollowupPrompt { .. }
             | AwsEvent::ParseError { .. } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // 忽略这些事件
             }
         }
 
         sse_events
+    }
+
+    fn parse_kiro_thinking_tags_if_needed(&mut self, text: &str) -> Vec<KiroTextSegment> {
+        // 如果已经出现 Kiro 官方 reasoningContentEvent，则不要再解析 `<thinking>` 标签，避免重复
+        if self.kiro_seen_reasoning_event {
+            return vec![KiroTextSegment {
+                kind: KiroTextSegmentKind::Content,
+                text: text.to_string(),
+            }];
+        }
+
+        self.kiro_thinking_tag_parser.push_and_parse(text)
+    }
+
+    fn flush_kiro_thinking_tag_buffer(&mut self) -> Vec<String> {
+        if self.kiro_seen_reasoning_event {
+            // 避免在已使用 reasoningContentEvent 的情况下，再输出缓存内容造成重复/错序
+            self.kiro_thinking_tag_parser.disable();
+            return vec![];
+        }
+
+        let segments = self.kiro_thinking_tag_parser.flush_finish();
+        if segments.is_empty() {
+            return vec![];
+        }
+
+        let mut out = Vec::new();
+        match self.target_format {
+            StreamFormat::OpenAiSse => {
+                for seg in segments {
+                    match seg.kind {
+                        KiroTextSegmentKind::Content => {
+                            self.accumulated_content.push_str(&seg.text);
+                            out.push(self.create_openai_content_chunk(&seg.text, false));
+                        }
+                        KiroTextSegmentKind::Thinking => {
+                            out.push(self.create_openai_reasoning_chunk(&seg.text, false));
+                        }
+                    }
+                }
+            }
+            StreamFormat::AnthropicSse => {
+                // Anthropic SSE 需要 message_start 才能输出内容块
+                if !self.message_started {
+                    out.push(self.create_anthropic_message_start());
+                    self.message_started = true;
+                }
+
+                for seg in segments {
+                    match seg.kind {
+                        KiroTextSegmentKind::Content => {
+                            self.emit_aws_content_as_anthropic(&mut out, &seg.text);
+                        }
+                        KiroTextSegmentKind::Thinking => {
+                            self.emit_aws_thinking_as_anthropic(&mut out, &seg.text, None);
+                        }
+                    }
+                }
+            }
+            StreamFormat::AwsEventStream => {}
+        }
+
+        out
+    }
+
+    fn emit_aws_content_as_anthropic(&mut self, sse_events: &mut Vec<String>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // 累积内容（用于重建完整响应）
+        self.accumulated_content.push_str(text);
+
+        // 如果 thinking 块还开着，先关闭它再开始输出文本
+        if let Some(thinking_idx) = self.thinking_block_index.take() {
+            sse_events.push(self.create_anthropic_content_block_stop(thinking_idx));
+        }
+
+        // 确保文本内容块已开始
+        let text_idx = if let Some(idx) = self.text_block_index {
+            idx
+        } else {
+            let idx = self.next_content_block_index;
+            self.next_content_block_index += 1;
+            self.text_block_index = Some(idx);
+            sse_events.push(self.create_anthropic_content_block_start_text(idx));
+            idx
+        };
+
+        // 发送 content_block_delta
+        sse_events.push(self.create_anthropic_text_delta(text_idx, text));
+    }
+
+    fn emit_aws_thinking_as_anthropic(
+        &mut self,
+        sse_events: &mut Vec<String>,
+        text: &str,
+        signature: Option<&str>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        // 如果已经开始输出文本，则不要再插入 thinking（避免块交错导致协议不一致）
+        if self.text_block_index.is_some() {
+            // 最小兼容：忽略后续 thinking
+            return;
+        }
+
+        // 启动 thinking 内容块（若尚未启动）
+        let idx = if let Some(idx) = self.thinking_block_index {
+            idx
+        } else {
+            let idx = self.next_content_block_index;
+            self.next_content_block_index += 1;
+            self.thinking_block_index = Some(idx);
+            sse_events.push(self.create_anthropic_content_block_start_thinking(idx, signature));
+            idx
+        };
+
+        // thinking delta
+        sse_events.push(self.create_anthropic_thinking_delta(idx, text));
     }
 
     /// 转换 Anthropic SSE（直通或转换为 OpenAI）
@@ -1116,11 +1550,56 @@ mod tests {
             "test-model",
         );
 
-        let events = converter.convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
+        let events = converter
+            .convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
         assert!(
             events.iter().any(|e| e.contains("\"reasoning_content\"")),
             "OpenAI SSE 应输出 reasoning_content"
         );
+    }
+
+    #[test]
+    fn test_aws_to_openai_thinking_tag_in_content_as_reasoning_content() {
+        let mut converter = StreamConverter::with_model(
+            StreamFormat::AwsEventStream,
+            StreamFormat::OpenAiSse,
+            "test-model",
+        );
+
+        let events = converter.convert(b"{\"content\":\"<thinking>think</thinking>Hello\"}");
+
+        assert!(
+            events.iter().any(|e| e.contains("\"reasoning_content\"")),
+            "当 content 中包含 <thinking>...</thinking> 时，应回调 reasoning_content"
+        );
+
+        let content = extract_content_from_sse(&events, StreamFormat::OpenAiSse);
+        assert_eq!(content, "Hello");
+        assert_eq!(converter.accumulated_content(), "Hello");
+    }
+
+    #[test]
+    fn test_aws_to_openai_thinking_tag_split_across_events() {
+        let mut converter = StreamConverter::with_model(
+            StreamFormat::AwsEventStream,
+            StreamFormat::OpenAiSse,
+            "test-model",
+        );
+
+        let events1 = converter.convert(b"{\"content\":\"<think\"}");
+        let events2 = converter.convert(b"{\"content\":\"ing>t</thinking>Hi\"}");
+
+        let all_events: Vec<_> = events1.into_iter().chain(events2).collect();
+
+        assert!(
+            all_events
+                .iter()
+                .any(|e| e.contains("\"reasoning_content\"")),
+            "标签被切块时仍应能解析出 reasoning_content"
+        );
+
+        let content = extract_content_from_sse(&all_events, StreamFormat::OpenAiSse);
+        assert_eq!(content, "Hi");
     }
 
     #[test]
@@ -1167,6 +1646,25 @@ mod tests {
 
         let content = extract_content_from_sse(&events, StreamFormat::AnthropicSse);
         assert_eq!(content, "Hello!");
+    }
+
+    #[test]
+    fn test_aws_to_anthropic_thinking_tag_in_content_as_thinking_block() {
+        let mut converter = StreamConverter::with_model(
+            StreamFormat::AwsEventStream,
+            StreamFormat::AnthropicSse,
+            "test-model",
+        );
+
+        let events = converter.convert(b"{\"content\":\"<thinking>think</thinking>Hello\"}");
+
+        assert!(
+            events.iter().any(|e| e.contains("thinking_delta")),
+            "当 content 中包含 <thinking>...</thinking> 时，应回调 thinking_delta"
+        );
+
+        let content = extract_content_from_sse(&events, StreamFormat::AnthropicSse);
+        assert_eq!(content, "Hello");
     }
 
     #[test]
