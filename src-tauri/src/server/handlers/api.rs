@@ -1910,6 +1910,117 @@ pub async fn anthropic_messages(
         ),
     );
 
+    // 注意：如果请求了 stream=true，这里必须使用真正的端到端流式传输。
+    //
+    // 之前的实现是：先 `resp.bytes().await` 把上游完整响应读到内存里，再用 `build_anthropic_stream_response`
+    // 一次性回放成 SSE —— 客户端会表现为“等很久后突然一下子收到全部 chunk”，这不是真流式。
+    if request.stream {
+        use crate::flow_monitor::stream_rebuilder::StreamFormat as FlowStreamFormat;
+        use crate::streaming::traits::StreamingProvider;
+        use crate::streaming::{StreamContext, StreamFormat as StreamingFormat, StreamManager};
+        use axum::body::Bytes;
+        use futures::StreamExt;
+
+        // 开启 Flow 的流式重建（用于捕获/统计）。这里返回的是 Anthropic SSE，所以使用 Anthropic 格式。
+        if let Some(fid) = &flow_id {
+            state
+                .flow_monitor
+                .set_streaming(fid, FlowStreamFormat::Anthropic)
+                .await;
+        }
+
+        // 1) 先向上游发起真正的流式请求，拿到字节流（AWS Event Stream）
+        let kiro = state.kiro.read().await;
+        let source_stream = match kiro.call_api_stream(&openai_request).await {
+            Ok(s) => s,
+            Err(e) => {
+                state.logs.write().await.add(
+                    "error",
+                    &format!("[KIRO_STREAM] 上游流式请求失败: {}", e),
+                );
+                if let Some(fid) = &flow_id {
+                    let error = FlowError::new(FlowErrorType::Network, &e.to_string());
+                    state.flow_monitor.fail_flow(fid, error).await;
+                }
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                )
+                    .into_response();
+            }
+        };
+        drop(kiro);
+
+        // 2) 边接收边转换：AWS Event Stream -> Anthropic SSE
+        let manager = StreamManager::with_default_config();
+        let context = StreamContext::new(
+            flow_id.clone(),
+            StreamingFormat::AwsEventStream,
+            StreamingFormat::AnthropicSse,
+            &request.model,
+        );
+        let mut converted_stream = manager.handle_stream(context, source_stream);
+
+        let flow_monitor = state.flow_monitor.clone();
+        let flow_id_for_stream = flow_id.clone();
+
+        let body_stream = async_stream::stream! {
+            while let Some(item) = converted_stream.next().await {
+                match item {
+                    Ok(event) => {
+                        // 同步更新 FlowMonitor（避免 tokio::spawn 导致尾部 chunk 丢失的竞态）
+                        if let Some(fid) = flow_id_for_stream.as_deref() {
+                            // SSE 格式: "event: xxx\ndata: {...}\n\n"
+                            let mut event_type: Option<&str> = None;
+                            let mut data: Option<&str> = None;
+                            for line in event.lines() {
+                                if let Some(v) = line.strip_prefix("event: ") {
+                                    event_type = Some(v);
+                                } else if let Some(v) = line.strip_prefix("data: ") {
+                                    data = Some(v);
+                                }
+                            }
+
+                            if let Some(d) = data {
+                                flow_monitor.process_chunk(fid, event_type, d).await;
+                            }
+                        }
+
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+                    }
+                    Err(e) => {
+                        if let Some(fid) = flow_id_for_stream.as_deref() {
+                            let error = FlowError::new(FlowErrorType::Network, &e.to_string());
+                            flow_monitor.fail_flow(fid, error).await;
+                        }
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(e.to_sse_error()));
+                        break;
+                    }
+                }
+            }
+
+            // 流结束：用重建器产出最终响应并完成 Flow（如果还存在）
+            if let Some(fid) = flow_id_for_stream.as_deref() {
+                flow_monitor.complete_flow(fid, None).await;
+            }
+        };
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .header("X-Accel-Buffering", "no")
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": {"message": "Failed to build streaming response"}})),
+                )
+                    .into_response()
+            });
+    }
+
     let kiro = state.kiro.read().await;
 
     match kiro.call_api(&openai_request).await {
