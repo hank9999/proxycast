@@ -64,7 +64,8 @@ pub async fn call_provider_anthropic(
         if let Some(fid) = flow_id {
             // 根据凭证类型确定流格式
             let format = match &credential.credential {
-                CredentialData::KiroOAuth { .. } => StreamFormat::OpenAI,
+                // /v1/messages 的流式响应是 Anthropic SSE
+                CredentialData::KiroOAuth { .. } => StreamFormat::Anthropic,
                 CredentialData::ClaudeKey { .. } => StreamFormat::Anthropic,
                 CredentialData::AntigravityOAuth { .. } => StreamFormat::Gemini,
                 _ => StreamFormat::Unknown,
@@ -142,6 +143,91 @@ pub async fn call_provider_anthropic(
             if thinking_enabled {
                 ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
             }
+
+            // 关键修复：当客户端请求 stream=true 时，必须使用真正的端到端流式传输。
+            // 之前的实现会先 `resp.bytes().await` 把上游完整响应读完，再回放为 SSE，
+            // 客户端表现为“等很久后一次性收到所有 SSE chunk”。
+            if request.stream {
+                use crate::providers::ProviderError;
+                use crate::streaming::traits::StreamingProvider;
+
+                let source_stream = match kiro.call_api_stream(&openai_request).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // 认证失败时尝试强制刷新 token 后重试一次（与非流式逻辑保持一致）
+                        if matches!(
+                            e,
+                            ProviderError::AuthenticationError(_) | ProviderError::TokenExpired(_)
+                        ) {
+                            let new_token = match state
+                                .token_cache
+                                .refresh_and_cache(db, &credential.uuid, true)
+                                .await
+                            {
+                                Ok(t) => t,
+                                Err(refresh_err) => {
+                                    let _ = state.pool_service.mark_unhealthy(
+                                        db,
+                                        &credential.uuid,
+                                        Some(&format!(
+                                            "Token refresh failed: {}",
+                                            refresh_err.to_string()
+                                        )),
+                                    );
+                                    return (
+                                        StatusCode::UNAUTHORIZED,
+                                        Json(serde_json::json!({"error": {"message": format!("Token refresh failed: {}", refresh_err)}})),
+                                    )
+                                        .into_response();
+                                }
+                            };
+
+                            kiro.credentials.access_token = Some(new_token);
+                            match kiro.call_api_stream(&openai_request).await {
+                                Ok(s) => s,
+                                Err(retry_err) => {
+                                    let _ = state.pool_service.mark_unhealthy(
+                                        db,
+                                        &credential.uuid,
+                                        Some(&retry_err.to_string()),
+                                    );
+                                    return (
+                                        StatusCode::BAD_GATEWAY,
+                                        Json(serde_json::json!({"error": {"message": retry_err.to_string()}})),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        } else {
+                            let _ = state.pool_service.mark_unhealthy(
+                                db,
+                                &credential.uuid,
+                                Some(&e.to_string()),
+                            );
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                            )
+                                .into_response();
+                        }
+                    }
+                };
+
+                // 记录成功（流式：只要成功拿到字节流，就认为本次调用可用）
+                let _ = state.pool_service.mark_healthy(db, &credential.uuid, Some(&request.model));
+                let _ = state.pool_service.record_usage(db, &credential.uuid);
+
+                return handle_streaming_response(
+                    state,
+                    flow_id,
+                    source_stream,
+                    StreamingFormat::AwsEventStream,
+                    StreamingFormat::AnthropicSse,
+                    &request.model,
+                )
+                .await;
+            }
+
             let resp = match kiro.call_api(&openai_request).await {
                 Ok(r) => r,
                 Err(e) => {
