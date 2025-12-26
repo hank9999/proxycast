@@ -142,6 +142,57 @@ pub async fn call_provider_anthropic(
             if thinking_enabled {
                 ensure_kiro_thinking_tags(&mut openai_request, DEFAULT_MAX_THINKING_LENGTH);
             }
+
+            // 流式请求：使用真正的端到端流式传输
+            if request.stream {
+                use crate::streaming::traits::StreamingProvider;
+
+                tracing::info!(
+                    "[KIRO_STREAM] 启动真正的流式传输: model={} credential={}",
+                    request.model,
+                    &credential.uuid[..8]
+                );
+
+                match kiro.call_api_stream(&openai_request).await {
+                    Ok(source_stream) => {
+                        // 记录成功开始流式传输
+                        let _ = state.pool_service.mark_healthy(
+                            db,
+                            &credential.uuid,
+                            Some(&request.model),
+                        );
+                        let _ = state.pool_service.record_usage(db, &credential.uuid);
+
+                        // 使用 StreamManager 处理流式转换
+                        // AWS Event Stream -> Anthropic SSE
+                        return handle_streaming_response(
+                            state,
+                            flow_id,
+                            source_stream,
+                            StreamingFormat::AwsEventStream,
+                            StreamingFormat::AnthropicSse,
+                            &request.model,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        // 流式请求失败，记录错误
+                        let _ = state.pool_service.mark_unhealthy(
+                            db,
+                            &credential.uuid,
+                            Some(&e.to_string()),
+                        );
+                        tracing::error!("[KIRO_STREAM] 流式请求失败: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            // 非流式请求：使用原有逻辑
             let resp = match kiro.call_api(&openai_request).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -180,11 +231,7 @@ pub async fn call_provider_anthropic(
                             Some(&request.model),
                         );
                         let _ = state.pool_service.record_usage(db, &credential.uuid);
-                        if request.stream {
-                            build_anthropic_stream_response(&request.model, &parsed)
-                        } else {
-                            build_anthropic_response(&request.model, &parsed)
-                        }
+                        build_anthropic_response(&request.model, &parsed)
                     }
                     Err(e) => {
                         let _ = state.pool_service.mark_unhealthy(
@@ -200,7 +247,7 @@ pub async fn call_provider_anthropic(
                     }
                 }
             } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                // Token 过期，强制刷新并重试
+                // Token 过期，强制刷新并重试（仅非流式请求会走到这里）
                 tracing::info!(
                     "[POOL] Got {}, forcing token refresh for {}",
                     status,
@@ -251,11 +298,8 @@ pub async fn call_provider_anthropic(
                                         Some(&request.model),
                                     );
                                     let _ = state.pool_service.record_usage(db, &credential.uuid);
-                                    if request.stream {
-                                        build_anthropic_stream_response(&request.model, &parsed)
-                                    } else {
-                                        build_anthropic_response(&request.model, &parsed)
-                                    }
+                                    // 非流式请求，直接返回 JSON 响应
+                                    build_anthropic_response(&request.model, &parsed)
                                 }
                                 Err(e) => {
                                     let _ = state.pool_service.mark_unhealthy(

@@ -1912,6 +1912,53 @@ pub async fn anthropic_messages(
 
     let kiro = state.kiro.read().await;
 
+    // 流式请求：使用真正的端到端流式传输（legacy mode）
+    if request.stream {
+        use crate::streaming::traits::StreamingProvider;
+        use crate::streaming::StreamFormat as StreamingFormat;
+
+        state.logs.write().await.add(
+            "info",
+            &format!(
+                "[KIRO_STREAM] Legacy mode: 启动真正的流式传输 model={}",
+                request.model
+            ),
+        );
+
+        match kiro.call_api_stream(&openai_request).await {
+            Ok(source_stream) => {
+                // 使用 StreamManager 处理流式转换
+                // AWS Event Stream -> Anthropic SSE
+                return super::handle_streaming_response(
+                    &state,
+                    flow_id.as_deref(),
+                    source_stream,
+                    StreamingFormat::AwsEventStream,
+                    StreamingFormat::AnthropicSse,
+                    &request.model,
+                )
+                .await;
+            }
+            Err(e) => {
+                state.logs.write().await.add(
+                    "error",
+                    &format!("[KIRO_STREAM] Legacy mode 流式请求失败: {}", e),
+                );
+                // 标记 Flow 失败
+                if let Some(fid) = &flow_id {
+                    let error = FlowError::new(FlowErrorType::Network, &e.to_string());
+                    state.flow_monitor.fail_flow(fid, error).await;
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": {"message": e.to_string()}})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // 非流式请求：使用原有逻辑
     match kiro.call_api(&openai_request).await {
         Ok(resp) => {
             let status = resp.status();
@@ -1983,72 +2030,7 @@ pub async fn anthropic_messages(
                             );
                         }
 
-                        // 如果请求流式响应，返回 SSE 格式
-                        if request.stream {
-                            // 完成 Flow 捕获并检查响应拦截（流式）
-                            // **Validates: Requirements 2.1, 2.5**
-                            if let Some(fid) = &flow_id {
-                                let (est_input, est_output) = parsed.estimate_tokens();
-                                let llm_response = build_llm_response(
-                                    200,
-                                    &parsed.content,
-                                    Some((est_input, est_output)),
-                                );
-
-                                // 检查是否需要拦截响应
-                                if let Some(modified_response) = check_response_intercept(
-                                    &state,
-                                    fid,
-                                    &llm_response,
-                                    &llm_request,
-                                    &flow_metadata,
-                                )
-                                .await
-                                {
-                                    // 响应被修改，需要重新构建响应
-                                    state.logs.write().await.add(
-                                        "info",
-                                        &format!("[INTERCEPT] 流式响应被修改: flow_id={}", fid),
-                                    );
-
-                                    // 使用修改后的响应完成 Flow
-                                    state
-                                        .flow_monitor
-                                        .complete_flow(fid, Some(modified_response.clone()))
-                                        .await;
-
-                                    // 构建修改后的流式响应
-                                    // 注意：这里简化处理，实际应该构建完整的流式响应
-                                    return (
-                                        StatusCode::OK,
-                                        Json(serde_json::json!({
-                                            "id": format!("msg_{}", uuid::Uuid::new_v4()),
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "content": [{
-                                                "type": "text",
-                                                "text": modified_response.content
-                                            }],
-                                            "model": request.model,
-                                            "stop_reason": "end_turn",
-                                            "stop_sequence": null,
-                                            "usage": {
-                                                "input_tokens": modified_response.usage.input_tokens,
-                                                "output_tokens": modified_response.usage.output_tokens
-                                            }
-                                        })),
-                                    )
-                                        .into_response();
-                                }
-
-                                state
-                                    .flow_monitor
-                                    .complete_flow(fid, Some(llm_response))
-                                    .await;
-                            }
-                            return build_anthropic_stream_response(&request.model, &parsed);
-                        }
-
+                        // 流式请求已在前面处理，这里只处理非流式响应
                         // 完成 Flow 捕获并检查响应拦截（非流式）
                         // **Validates: Requirements 2.1, 2.5**
                         if let Some(fid) = &flow_id {
@@ -2225,50 +2207,27 @@ pub async fn anthropic_messages(
                                                         )
                                                         .await;
 
-                                                    // 构建修改后的响应
-                                                    if request.stream {
-                                                        return (
-                                                            StatusCode::OK,
-                                                            Json(serde_json::json!({
-                                                                "id": format!("msg_{}", uuid::Uuid::new_v4()),
-                                                                "type": "message",
-                                                                "role": "assistant",
-                                                                "content": [{
-                                                                    "type": "text",
-                                                                    "text": modified_response.content
-                                                                }],
-                                                                "model": request.model,
-                                                                "stop_reason": "end_turn",
-                                                                "stop_sequence": null,
-                                                                "usage": {
-                                                                    "input_tokens": modified_response.usage.input_tokens,
-                                                                    "output_tokens": modified_response.usage.output_tokens
-                                                                }
-                                                            })),
-                                                        )
-                                                            .into_response();
-                                                    } else {
-                                                        return (
-                                                            StatusCode::OK,
-                                                            Json(serde_json::json!({
-                                                                "id": format!("msg_{}", uuid::Uuid::new_v4()),
-                                                                "type": "message",
-                                                                "role": "assistant",
-                                                                "content": [{
-                                                                    "type": "text",
-                                                                    "text": modified_response.content
-                                                                }],
-                                                                "model": request.model,
-                                                                "stop_reason": "end_turn",
-                                                                "stop_sequence": null,
-                                                                "usage": {
-                                                                    "input_tokens": modified_response.usage.input_tokens,
-                                                                    "output_tokens": modified_response.usage.output_tokens
-                                                                }
-                                                            })),
-                                                        )
-                                                            .into_response();
-                                                    }
+                                                    // 非流式请求，构建修改后的响应
+                                                    return (
+                                                        StatusCode::OK,
+                                                        Json(serde_json::json!({
+                                                            "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                                                            "type": "message",
+                                                            "role": "assistant",
+                                                            "content": [{
+                                                                "type": "text",
+                                                                "text": modified_response.content
+                                                            }],
+                                                            "model": request.model,
+                                                            "stop_reason": "end_turn",
+                                                            "stop_sequence": null,
+                                                            "usage": {
+                                                                "input_tokens": modified_response.usage.input_tokens,
+                                                                "output_tokens": modified_response.usage.output_tokens
+                                                            }
+                                                        })),
+                                                    )
+                                                        .into_response();
                                                 }
 
                                                 state
@@ -2276,12 +2235,7 @@ pub async fn anthropic_messages(
                                                     .complete_flow(fid, Some(llm_response))
                                                     .await;
                                             }
-                                            if request.stream {
-                                                return build_anthropic_stream_response(
-                                                    &request.model,
-                                                    &parsed,
-                                                );
-                                            }
+                                            // 非流式请求，直接返回 JSON 响应
                                             return build_anthropic_response(
                                                 &request.model,
                                                 &parsed,
