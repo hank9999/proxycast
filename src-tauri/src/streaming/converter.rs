@@ -439,6 +439,12 @@ pub struct StreamConverter {
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
     accumulated_content: String,
+    /// 累积的 thinking 内容（用于 token 估算）
+    accumulated_thinking: String,
+    /// 累积的工具调用参数长度（用于 token 估算）
+    accumulated_tool_args_len: usize,
+    /// 上下文使用百分比（用于估算 input tokens）
+    context_usage_percentage: f64,
     /// Kiro `<thinking>` 标签解析器（用于 assistantResponseEvent 混入 thinking 的场景）
     kiro_thinking_tag_parser: KiroThinkingTagParser,
 }
@@ -465,6 +471,9 @@ impl StreamConverter {
             thinking_block_index: None,
             message_started: false,
             accumulated_content: String::new(),
+            accumulated_thinking: String::new(),
+            accumulated_tool_args_len: 0,
+            context_usage_percentage: 0.0,
             kiro_thinking_tag_parser: KiroThinkingTagParser::new(),
         }
     }
@@ -491,6 +500,35 @@ impl StreamConverter {
         &self.accumulated_content
     }
 
+    /// 估算 output tokens
+    ///
+    /// 基于累积的响应内容长度估算 Token 数量（约 4 字符 = 1 token）：
+    /// - content: 文本内容
+    /// - thinking: 思考内容
+    /// - tool_args: 工具调用参数
+    pub fn estimate_output_tokens(&self) -> u32 {
+        let content_tokens = (self.accumulated_content.len() / 4) as u32;
+        let thinking_tokens = (self.accumulated_thinking.len() / 4) as u32;
+        let tool_args_tokens = (self.accumulated_tool_args_len / 4) as u32;
+        content_tokens + thinking_tokens + tool_args_tokens
+    }
+
+    /// 估算 input tokens
+    ///
+    /// 基于 context_usage_percentage 估算 input tokens
+    /// 假设 100% = 200k tokens (Claude 的上下文窗口)
+    pub fn estimate_input_tokens(&self) -> u32 {
+        ((self.context_usage_percentage / 100.0) * 200000.0) as u32
+    }
+
+    /// 估算 Token 使用量
+    ///
+    /// # 返回
+    /// (input_tokens, output_tokens) 元组
+    pub fn estimate_tokens(&self) -> (u32, u32) {
+        (self.estimate_input_tokens(), self.estimate_output_tokens())
+    }
+
     /// 重置转换器
     pub fn reset(&mut self) {
         if let Some(parser) = &mut self.aws_parser {
@@ -504,6 +542,9 @@ impl StreamConverter {
         self.thinking_block_index = None;
         self.message_started = false;
         self.accumulated_content.clear();
+        self.accumulated_thinking.clear();
+        self.accumulated_tool_args_len = 0;
+        self.context_usage_percentage = 0.0;
         self.kiro_thinking_tag_parser.reset();
     }
 
@@ -638,6 +679,8 @@ impl StreamConverter {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 if let Some(acc) = self.tool_accumulators.get_mut(id) {
                     acc.input.push_str(input);
+                    // 累积工具调用参数长度（用于 token 估算）
+                    self.accumulated_tool_args_len += input.len();
                 }
                 // 发送 input_json_delta
                 if let Some(acc) = self.tool_accumulators.get(id) {
@@ -664,9 +707,9 @@ impl StreamConverter {
                 context_percentage,
             } => {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
-                // Usage 信息在 message_delta 中发送
-                // 这里暂时忽略，在 finish() 中处理
-                let _ = (credits, context_percentage);
+                // 保存 context_usage_percentage 用于估算 input tokens
+                self.context_usage_percentage = *context_percentage;
+                let _ = credits;
             }
             AwsEvent::FollowupPrompt { .. } | AwsEvent::ParseError { .. } => {
                 // 忽略这些事件
@@ -692,6 +735,8 @@ impl StreamConverter {
                             sse_events.push(self.create_openai_content_chunk(&seg.text, false));
                         }
                         KiroTextSegmentKind::Thinking => {
+                            // 累积 thinking 内容（用于 token 估算）
+                            self.accumulated_thinking.push_str(&seg.text);
                             // OpenAI 协议扩展：使用 reasoning_content 输出思考内容
                             sse_events.push(self.create_openai_reasoning_chunk(&seg.text, false));
                         }
@@ -719,6 +764,8 @@ impl StreamConverter {
                 let (index, tool_id, tool_name) =
                     if let Some(acc) = self.tool_accumulators.get_mut(id) {
                         acc.input.push_str(input);
+                        // 累积工具调用参数长度（用于 token 估算）
+                        self.accumulated_tool_args_len += input.len();
                         (acc.index, acc.id.clone(), acc.name.clone())
                     } else {
                         return sse_events;
@@ -737,9 +784,14 @@ impl StreamConverter {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // 结束事件在 finish() 中处理
             }
-            AwsEvent::Usage { .. }
-            | AwsEvent::FollowupPrompt { .. }
-            | AwsEvent::ParseError { .. } => {
+            AwsEvent::Usage {
+                context_percentage, ..
+            } => {
+                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
+                // 保存 context_usage_percentage 用于估算 input tokens
+                self.context_usage_percentage = *context_percentage;
+            }
+            AwsEvent::FollowupPrompt { .. } | AwsEvent::ParseError { .. } => {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 // 忽略这些事件
             }
@@ -768,6 +820,8 @@ impl StreamConverter {
                             out.push(self.create_openai_content_chunk(&seg.text, false));
                         }
                         KiroTextSegmentKind::Thinking => {
+                            // 累积 thinking 内容（用于 token 估算）
+                            self.accumulated_thinking.push_str(&seg.text);
                             out.push(self.create_openai_reasoning_chunk(&seg.text, false));
                         }
                     }
@@ -831,6 +885,9 @@ impl StreamConverter {
         if text.is_empty() {
             return;
         }
+
+        // 累积 thinking 内容（用于 token 估算）
+        self.accumulated_thinking.push_str(text);
 
         // 如果已经开始输出文本，则不要再插入 thinking（避免块交错导致协议不一致）
         if self.text_block_index.is_some() {
@@ -1030,6 +1087,7 @@ impl StreamConverter {
     // ========================================================================
 
     fn create_anthropic_message_start(&self) -> String {
+        let input_tokens = self.estimate_input_tokens();
         let event = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -1041,7 +1099,7 @@ impl StreamConverter {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": 0,
+                    "input_tokens": input_tokens,
                     "output_tokens": 0
                 }
             }
@@ -1148,6 +1206,7 @@ impl StreamConverter {
     }
 
     fn create_anthropic_message_delta(&self) -> String {
+        let (input_tokens, output_tokens) = self.estimate_tokens();
         let event = serde_json::json!({
             "type": "message_delta",
             "delta": {
@@ -1155,7 +1214,8 @@ impl StreamConverter {
                 "stop_sequence": null
             },
             "usage": {
-                "output_tokens": 0
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens
             }
         });
         format!("event: message_delta\ndata: {}\n\n", event)
