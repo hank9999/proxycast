@@ -283,10 +283,88 @@ impl AwsEventStreamParser {
         let mut pos = 0;
 
         while pos < self.buffer.len() {
-            // 查找下一个 JSON 对象的开始位置
+            // 首先尝试解析 AWS Event Stream 二进制格式
+            // AWS Event Stream 格式: [total_length: 4][headers_length: 4][prelude_crc: 4][headers][payload][message_crc: 4]
+            if pos + 12 <= self.buffer.len() {
+                // 检查是否是 AWS Event Stream 格式（通过检查合理的长度值）
+                let total_length = u32::from_be_bytes([
+                    self.buffer[pos],
+                    self.buffer[pos + 1],
+                    self.buffer[pos + 2],
+                    self.buffer[pos + 3],
+                ]) as usize;
+                
+                let headers_length = u32::from_be_bytes([
+                    self.buffer[pos + 4],
+                    self.buffer[pos + 5],
+                    self.buffer[pos + 6],
+                    self.buffer[pos + 7],
+                ]) as usize;
+
+                // 验证长度是否合理（AWS Event Stream 消息通常在 50-10000 字节之间）
+                if total_length >= 16 && total_length <= 65536 
+                    && headers_length < total_length 
+                    && headers_length >= 8 
+                {
+                    // 检查是否有完整的消息
+                    if pos + total_length <= self.buffer.len() {
+                        // 提取 payload
+                        // payload 开始位置: pos + 12 (prelude) + headers_length
+                        // payload 长度: total_length - 12 (prelude) - headers_length - 4 (message_crc)
+                        let payload_start = pos + 12 + headers_length;
+                        let payload_length = total_length - 12 - headers_length - 4;
+                        
+                        if payload_start + payload_length <= self.buffer.len() && payload_length > 0 {
+                            // 先复制 payload 数据，避免借用冲突
+                            let payload_bytes = self.buffer[payload_start..payload_start + payload_length].to_vec();
+                            
+                            // 尝试将 payload 解析为 JSON
+                            if let Ok(json_str) = std::str::from_utf8(&payload_bytes) {
+                                let json_str = json_str.trim();
+                                if json_str.starts_with('{') && json_str.ends_with('}') {
+                                    
+                                    // 复制 json_str 以避免借用问题
+                                    let json_owned = json_str.to_string();
+                                    match self.parse_json_event(&json_owned) {
+                                        Ok(event_list) => events.extend(event_list),
+                                        Err(e) => {
+                                            self.parse_error_count += 1;
+                                            events.push(AwsEvent::ParseError {
+                                                message: e,
+                                                raw_data: Some(json_owned),
+                                            });
+                                        }
+                                    }
+                                    
+                                    pos += total_length;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // 如果 payload 不是有效 JSON，跳过这个消息
+                        pos += total_length;
+                        continue;
+                    } else {
+                        // 消息不完整，等待更多数据
+                        break;
+                    }
+                }
+            }
+
+            // 如果不是 AWS Event Stream 格式，尝试查找裸 JSON
             let start = match self.find_json_start(pos) {
                 Some(s) => s,
-                None => break,
+                None => {
+                    // 调试：没有找到 JSON 开始
+                    if self.buffer.len() > pos {
+                        let preview: String = self.buffer[pos..].iter()
+                            .take(100)
+                            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                            .collect();
+                    }
+                    break;
+                }
             };
 
             // 提取 JSON 对象
@@ -308,6 +386,10 @@ impl AwsEventStreamParser {
                 }
                 None => {
                     // JSON 对象不完整，等待更多数据
+                    let preview: String = self.buffer[start..].iter()
+                        .take(100)
+                        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                        .collect();
                     break;
                 }
             }
@@ -381,7 +463,55 @@ impl AwsEventStreamParser {
 
         let mut events = Vec::new();
 
-        // 处理 content 事件
+        // 处理 Kiro 的 assistantResponseEvent 嵌套格式
+        // 格式: {"assistantResponseEvent": {"content": "..."}}
+        if let Some(assistant_event) = value.get("assistantResponseEvent") {
+            // 处理 content
+            if let Some(content) = assistant_event.get("content").and_then(|v| v.as_str()) {
+                if !content.is_empty() {
+                    events.push(AwsEvent::Content {
+                        text: content.to_string(),
+                    });
+                }
+            }
+            // 处理 toolUse
+            if let Some(tool_use) = assistant_event.get("toolUse") {
+                if let Some(tool_use_id) = tool_use.get("toolUseId").and_then(|v| v.as_str()) {
+                    let name = tool_use
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_chunk = tool_use
+                        .get("input")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let tool_id = tool_use_id.to_string();
+                    let accumulator = self.tool_accumulators.entry(tool_id.clone()).or_default();
+
+                    if !name.is_empty() && accumulator.name.is_empty() {
+                        accumulator.name = name.clone();
+                        events.push(AwsEvent::ToolUseStart {
+                            id: tool_id.clone(),
+                            name,
+                        });
+                    }
+
+                    if !input_chunk.is_empty() {
+                        accumulator.input.push_str(&input_chunk);
+                        events.push(AwsEvent::ToolUseInput {
+                            id: tool_id.clone(),
+                            input: input_chunk,
+                        });
+                    }
+                }
+            }
+            return Ok(events);
+        }
+
+        // 处理 content 事件（顶层格式）
         if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
             // 跳过 followupPrompt
             if value.get("followupPrompt").is_some() {
