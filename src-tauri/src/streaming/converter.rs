@@ -33,12 +33,10 @@ impl Default for KiroThinkingTagParseState {
 
 /// Kiro `<thinking>...</thinking>` 标签增量解析器
 ///
-/// 背景：Kiro 在开启 thinking 模式时，理想情况下会通过 `reasoningContentEvent`
-/// 返回思考增量。但在部分场景下，思考内容会混入 `assistantResponseEvent` 的 `content`
+/// 背景：Kiro 在开启 thinking 模式时，思考内容会混入 `assistantResponseEvent` 的 `content`
 /// 字段中，以 `<thinking>...</thinking>` 标签包裹。
 ///
-/// 本解析器用于在 **没有** `reasoningContentEvent` 的情况下，把标签内文本拆分为
-/// thinking 段落，从而让上层可以回调到“思考块”里。
+/// 本解析器用于把标签内文本拆分为 thinking 段落，从而让上层可以回调到"思考块"里。
 ///
 /// 设计目标：
 /// - 增量解析：标签可能跨多个 chunk/事件分段
@@ -439,7 +437,7 @@ pub struct StreamConverter {
     thinking_block_index: Option<u32>,
     /// thinking 的 signature（Anthropic），需要以 signature_delta 的形式输出
     ///
-    /// Kiro 的 reasoningContentEvent 可能携带 signature，但 Anthropic 官方流式协议要求：
+    /// Anthropic 官方流式协议要求：
     /// - content_block_start 的 thinking 块不包含 signature 字段
     /// - signature 通过 content_block_delta 的 signature_delta 发送（通常在 thinking 结束前）
     anthropic_thinking_signature_pending: Option<String>,
@@ -447,12 +445,8 @@ pub struct StreamConverter {
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
     accumulated_content: String,
-    /// Kiro `<thinking>` 标签回退解析器（用于 assistantResponseEvent 混入 thinking 的场景）
+    /// Kiro `<thinking>` 标签解析器（用于 assistantResponseEvent 混入 thinking 的场景）
     kiro_thinking_tag_parser: KiroThinkingTagParser,
-    /// 是否已见到 Kiro 官方 reasoningContentEvent
-    ///
-    /// 一旦出现该事件，则优先以其为准，禁用 `<thinking>` 标签回退解析，避免重复/冲突。
-    kiro_seen_reasoning_event: bool,
 }
 
 impl StreamConverter {
@@ -479,7 +473,6 @@ impl StreamConverter {
             message_started: false,
             accumulated_content: String::new(),
             kiro_thinking_tag_parser: KiroThinkingTagParser::new(),
-            kiro_seen_reasoning_event: false,
         }
     }
 
@@ -520,20 +513,16 @@ impl StreamConverter {
         self.message_started = false;
         self.accumulated_content.clear();
         self.kiro_thinking_tag_parser.reset();
-        self.kiro_seen_reasoning_event = false;
     }
 
-    /// 转换 chunk
-    ///
-    /// 将源格式的 chunk 转换为目标格式的 SSE 事件列表。
-    ///
-    /// # 参数
-    ///
-    /// * `chunk` - 源格式的字节数据
-    ///
-    /// # 返回
-    ///
-    /// 目标格式的 SSE 事件字符串列表
+    // 转换 chunk
+    // 将源格式的 chunk 转换为目标格式的 SSE 事件列表。
+    //
+    // # 参数
+    // * `chunk` - 源格式的字节数据
+    //
+    // # 返回
+    // 目标格式的 SSE 事件字符串列表
     pub fn convert(&mut self, chunk: &[u8]) -> Vec<String> {
         if self.state == ConverterState::Idle {
             self.state = ConverterState::Converting;
@@ -620,44 +609,10 @@ impl StreamConverter {
                             self.emit_aws_content_as_anthropic(&mut sse_events, &seg.text);
                         }
                         KiroTextSegmentKind::Thinking => {
-                            // signature 只在 reasoningContentEvent 中才可能存在，这里回退解析统一视为 None
                             self.emit_aws_thinking_as_anthropic(&mut sse_events, &seg.text);
                         }
                     }
                 }
-            }
-            AwsEvent::Thinking { text, signature } => {
-                // Kiro 官方 reasoningContentEvent 优先：先输出已缓存的 content，再禁用 `<thinking>` 标签回退解析
-                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
-                self.kiro_seen_reasoning_event = true;
-                self.kiro_thinking_tag_parser.disable();
-
-                // 如果已经开始输出文本，则不要再插入 thinking（避免块交错导致协议不一致）
-                if self.text_block_index.is_some() {
-                    // 最小兼容：忽略后续 thinking
-                    return sse_events;
-                }
-
-                // 启动 thinking 内容块（若尚未启动）
-                let idx =
-                    if let Some(idx) = self.thinking_block_index {
-                        idx
-                    } else {
-                        let idx = self.next_content_block_index;
-                        self.next_content_block_index += 1;
-                        self.thinking_block_index = Some(idx);
-                        sse_events.push(self.create_anthropic_content_block_start_thinking(idx));
-                        idx
-                    };
-
-                if let Some(sig) = signature.as_deref() {
-                    if !sig.trim().is_empty() {
-                        self.anthropic_thinking_signature_pending = Some(sig.to_string());
-                    }
-                }
-
-                // thinking delta
-                sse_events.push(self.create_anthropic_thinking_delta(idx, text));
             }
             AwsEvent::ToolUseStart { id, name } => {
                 // 工具调用前先清空可能缓存的 `<thinking>` 标签内容，避免顺序错乱
@@ -751,15 +706,6 @@ impl StreamConverter {
                     }
                 }
             }
-            AwsEvent::Thinking { text, .. } => {
-                // Kiro 官方 reasoningContentEvent 优先：先输出已缓存的 content，再禁用 `<thinking>` 标签回退解析
-                sse_events.extend(self.flush_kiro_thinking_tag_buffer());
-                self.kiro_seen_reasoning_event = true;
-                self.kiro_thinking_tag_parser.disable();
-
-                // OpenAI 协议扩展：使用 reasoning_content 输出思考内容
-                sse_events.push(self.create_openai_reasoning_chunk(text, false));
-            }
             AwsEvent::ToolUseStart { id, name } => {
                 sse_events.extend(self.flush_kiro_thinking_tag_buffer());
                 let index = self.tool_accumulators.len() as u32;
@@ -811,24 +757,10 @@ impl StreamConverter {
     }
 
     fn parse_kiro_thinking_tags_if_needed(&mut self, text: &str) -> Vec<KiroTextSegment> {
-        // 如果已经出现 Kiro 官方 reasoningContentEvent，则不要再解析 `<thinking>` 标签，避免重复
-        if self.kiro_seen_reasoning_event {
-            return vec![KiroTextSegment {
-                kind: KiroTextSegmentKind::Content,
-                text: text.to_string(),
-            }];
-        }
-
         self.kiro_thinking_tag_parser.push_and_parse(text)
     }
 
     fn flush_kiro_thinking_tag_buffer(&mut self) -> Vec<String> {
-        if self.kiro_seen_reasoning_event {
-            // 避免在已使用 reasoningContentEvent 的情况下，再输出缓存内容造成重复/错序
-            self.kiro_thinking_tag_parser.disable();
-            return vec![];
-        }
-
         let segments = self.kiro_thinking_tag_parser.flush_finish();
         if segments.is_empty() {
             return vec![];
@@ -1568,22 +1500,6 @@ mod tests {
     }
 
     #[test]
-    fn test_aws_to_openai_thinking_as_reasoning_content() {
-        let mut converter = StreamConverter::with_model(
-            StreamFormat::AwsEventStream,
-            StreamFormat::OpenAiSse,
-            "test-model",
-        );
-
-        let events = converter
-            .convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
-        assert!(
-            events.iter().any(|e| e.contains("\"reasoning_content\"")),
-            "OpenAI SSE 应输出 reasoning_content"
-        );
-    }
-
-    #[test]
     fn test_aws_to_openai_thinking_tag_in_content_as_reasoning_content() {
         let mut converter = StreamConverter::with_model(
             StreamFormat::AwsEventStream,
@@ -1690,39 +1606,6 @@ mod tests {
 
         let content = extract_content_from_sse(&events, StreamFormat::AnthropicSse);
         assert_eq!(content, "Hello");
-    }
-
-    #[test]
-    fn test_aws_to_anthropic_thinking_signature_delta() {
-        let mut converter = StreamConverter::with_model(
-            StreamFormat::AwsEventStream,
-            StreamFormat::AnthropicSse,
-            "test-model",
-        );
-
-        let events1 =
-            converter.convert(b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}");
-        let events2 = converter.finish();
-
-        let all_events: Vec<_> = events1.into_iter().chain(events2).collect();
-
-        // thinking 的 content_block_start 不应该带 signature
-        let thinking_start = all_events
-            .iter()
-            .find(|e| e.contains("event: content_block_start") && e.contains("\"type\":\"thinking\""))
-            .expect("missing thinking content_block_start");
-        assert!(
-            !thinking_start.contains("\"signature\""),
-            "thinking content_block_start 不应包含 signature"
-        );
-
-        // 必须存在 signature_delta
-        assert!(
-            all_events
-                .iter()
-                .any(|e| e.contains("\"type\":\"signature_delta\"") && e.contains("sig")),
-            "Anthropic SSE 应输出 signature_delta"
-        );
     }
 
     #[test]

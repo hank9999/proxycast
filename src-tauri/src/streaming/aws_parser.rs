@@ -47,17 +47,6 @@ pub enum AwsEvent {
         text: String,
     },
 
-    /// 思考内容增量（Kiro 官方 reasoningContentEvent）
-    ///
-    /// 当请求启用 thinking 模式时，Kiro 会通过该事件返回思考内容，而不是把 `<thinking>` 标签混入 content。
-    Thinking {
-        /// 思考文本
-        text: String,
-        /// 可选签名（用于 Claude thinking block）
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-    },
-
     /// 工具调用开始
     ///
     /// 对应需求 2.3: 累积工具调用数据
@@ -392,21 +381,6 @@ impl AwsEventStreamParser {
 
         let mut events = Vec::new();
 
-        // 处理 reasoningContentEvent（思考增量）
-        if let Some(re) = value.get("reasoningContentEvent") {
-            let text = re.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let signature = re
-                .get("signature")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string());
-
-            if !text.is_empty() {
-                events.push(AwsEvent::Thinking { text, signature });
-            }
-            return Ok(events);
-        }
-
         // 处理 content 事件
         if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
             // 跳过 followupPrompt
@@ -495,13 +469,6 @@ impl AwsEventStreamParser {
 pub fn serialize_event(event: &AwsEvent) -> Option<String> {
     match event {
         AwsEvent::Content { text } => Some(serde_json::json!({"content": text}).to_string()),
-        AwsEvent::Thinking { text, signature } => {
-            let mut re = serde_json::json!({"text": text});
-            if let Some(sig) = signature {
-                re["signature"] = serde_json::json!(sig);
-            }
-            Some(serde_json::json!({"reasoningContentEvent": re}).to_string())
-        }
         AwsEvent::ToolUseStart { id, name } => {
             Some(serde_json::json!({"toolUseId": id, "name": name}).to_string())
         }
@@ -622,20 +589,6 @@ mod tests {
         assert_eq!(events.len(), 2);
         let content = extract_content(&events);
         assert_eq!(content, "Hello, world!");
-    }
-
-    #[test]
-    fn test_parse_thinking_event() {
-        let mut parser = AwsEventStreamParser::new();
-        let events = parser.process(
-            b"{\"reasoningContentEvent\":{\"text\":\"think\",\"signature\":\"sig\"}}",
-        );
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            AwsEvent::Thinking { text, signature } if text == "think" && signature.as_deref() == Some("sig")
-        ));
     }
 
     #[test]

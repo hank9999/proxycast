@@ -126,7 +126,7 @@ pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CW
 
     // 搜索所有 JSON 对象的模式
     // AWS Event Stream 格式: [binary headers]{"content":"..."}[binary trailer]
-    let mut json_patterns: Vec<&[u8]> = vec![
+    let json_patterns: Vec<&[u8]> = vec![
         b"{\"content\":",
         b"{\"name\":",
         b"{\"input\":",
@@ -136,10 +136,6 @@ pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CW
         b"{\"unit\":",                   // meteringEvent
         b"{\"contextUsagePercentage\":", // contextUsageEvent
     ];
-    if options.extract_thinking {
-        // Kiro 官方 reasoning/thinking 事件
-        json_patterns.push(b"{\"reasoningContentEvent\":");
-    }
 
     let mut pos = 0;
     while pos < bytes.len() {
@@ -163,23 +159,6 @@ pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CW
         // 从 start 位置提取完整的 JSON 对象
         if let Some(json_str) = extract_json_from_bytes(&bytes[start..]) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                // 处理 reasoningContentEvent: {"reasoningContentEvent":{"text":"...","signature":"..."}}
-                if options.extract_thinking {
-                    if let Some(re) = value.get("reasoningContentEvent") {
-                        if let Some(text) = re.get("text").and_then(|v| v.as_str()) {
-                            thinking_text.push_str(text);
-                        }
-                        if let Some(sig) = re.get("signature").and_then(|v| v.as_str()) {
-                            if !sig.trim().is_empty() {
-                                thinking_signature = Some(sig.to_string());
-                            }
-                        }
-                        // reasoning 事件不应进入 content
-                        pos = start + json_str.len();
-                        continue;
-                    }
-                }
-
                 // 处理 content 事件
                 if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                     // 跳过 followupPrompt
