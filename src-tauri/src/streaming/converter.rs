@@ -507,9 +507,9 @@ impl StreamConverter {
     /// - thinking: 思考内容
     /// - tool_args: 工具调用参数
     pub fn estimate_output_tokens(&self) -> u32 {
-        let content_tokens = (self.accumulated_content.len() / 4) as u32;
-        let thinking_tokens = (self.accumulated_thinking.len() / 4) as u32;
-        let tool_args_tokens = (self.accumulated_tool_args_len / 4) as u32;
+        let content_tokens = (self.accumulated_content.len() / 3) as u32;
+        let thinking_tokens = (self.accumulated_thinking.len() / 3) as u32;
+        let tool_args_tokens = (self.accumulated_tool_args_len / 3) as u32;
         content_tokens + thinking_tokens + tool_args_tokens
     }
 
@@ -518,7 +518,7 @@ impl StreamConverter {
     /// 基于 context_usage_percentage 估算 input tokens
     /// 假设 100% = 200k tokens (Claude 的上下文窗口)
     pub fn estimate_input_tokens(&self) -> u32 {
-        ((self.context_usage_percentage / 100.0) * 200000.0) as u32
+        (((self.context_usage_percentage / 100.0) * 200000.0)/0.59) as u32
     }
 
     /// 估算 Token 使用量

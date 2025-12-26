@@ -60,17 +60,17 @@ impl CWParsedResponse {
     /// (input_tokens, output_tokens) 元组
     pub fn estimate_tokens(&self) -> (u32, u32) {
         // 估算 output tokens: 基于响应内容长度 (约 4 字符 = 1 token)
-        let mut output_tokens: u32 = (self.content.len() / 4) as u32;
+        let mut output_tokens: u32 = (self.content.len() / 3) as u32;
         if let Some(thinking) = &self.thinking {
-            output_tokens += (thinking.text.len() / 4) as u32;
+            output_tokens += (thinking.text.len() / 3) as u32;
         }
         for tc in &self.tool_calls {
-            output_tokens += (tc.function.arguments.len() / 4) as u32;
+            output_tokens += (tc.function.arguments.len() / 3) as u32;
         }
 
         // 从 context_usage_percentage 估算 input tokens
         // 假设 100% = 200k tokens (Claude 的上下文窗口)
-        let input_tokens = ((self.context_usage_percentage / 100.0) * 200000.0) as u32;
+        let input_tokens = (((self.context_usage_percentage / 100.0) * 200000.0)/0.59) as u32;
 
         (input_tokens, output_tokens)
     }
@@ -466,7 +466,7 @@ pub fn build_anthropic_response(model: &str, parsed: &CWParsedResponse) -> Respo
     }
     // 从 context_usage_percentage 估算 input tokens
     // 假设 100% = 200k tokens (Claude 的上下文窗口)
-    let input_tokens = ((parsed.context_usage_percentage / 100.0) * 200000.0) as u32;
+    let input_tokens = (((parsed.context_usage_percentage / 100.0) * 200000.0)/0.59) as u32;
 
     let response = serde_json::json!({
         "id": format!("msg_{}", uuid::Uuid::new_v4()),
