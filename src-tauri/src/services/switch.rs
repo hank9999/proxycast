@@ -86,42 +86,98 @@ impl SwitchService {
     }
 
     pub fn switch_provider(db: &DbConnection, app_type: &str, id: &str) -> Result<(), String> {
+        use tracing::{error, info, warn};
+
+        info!("开始切换 {} 配置到 provider: {}", app_type, id);
+
         let conn = db.lock().map_err(|e| e.to_string())?;
 
         // Get target provider
         let target_provider = ProviderDao::get_by_id(&conn, app_type, id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Provider not found: {id}"))?;
+            .map_err(|e| {
+                error!("查找目标 provider 失败: {}", e);
+                e.to_string()
+            })?
+            .ok_or_else(|| {
+                error!("目标 provider 不存在: {}", id);
+                format!("Provider not found: {id}")
+            })?;
 
-        let app_type_enum = app_type.parse::<AppType>().map_err(|e| e.to_string())?;
+        let app_type_enum = app_type.parse::<AppType>().map_err(|e| {
+            error!("无效的 app_type: {} - {}", app_type, e);
+            e.to_string()
+        })?;
 
-        // Skip backfill and sync for ProxyCast
+        // 获取当前 provider（用于回填和回滚）
+        let current_provider = if app_type_enum != AppType::ProxyCast {
+            ProviderDao::get_current(&conn, app_type).map_err(|e| {
+                error!("获取当前 provider 失败: {}", e);
+                e.to_string()
+            })?
+        } else {
+            None
+        };
+
+        // 实施事务保护：先尝试同步，再更新数据库
         if app_type_enum != AppType::ProxyCast {
-            // Backfill: Read current live config and save to current provider
-            if let Some(current_provider) =
-                ProviderDao::get_current(&conn, app_type).map_err(|e| e.to_string())?
-            {
-                // Only backfill if switching to a different provider
-                if current_provider.id != id {
-                    if let Ok(live_settings) = live_sync::read_live_settings(&app_type_enum) {
-                        // Update current provider with live settings
-                        let mut updated_provider = current_provider.clone();
-                        updated_provider.settings_config = live_settings;
-                        let _ = ProviderDao::update(&conn, &updated_provider);
+            // Step 1: Backfill - 回填当前配置
+            if let Some(ref current) = current_provider {
+                if current.id != id {
+                    info!("回填当前配置: {}", current.name);
+                    match live_sync::read_live_settings(&app_type_enum) {
+                        Ok(live_settings) => {
+                            let mut updated_provider = current.clone();
+                            updated_provider.settings_config = live_settings;
+                            if let Err(e) = ProviderDao::update(&conn, &updated_provider) {
+                                warn!("回填配置失败，但继续执行: {}", e);
+                            } else {
+                                info!("回填配置完成");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("读取当前配置失败，跳过回填: {}", e);
+                        }
                     }
                 }
             }
+
+            // Step 2: 尝试同步新配置（在更新数据库前验证）
+            info!("验证目标配置可同步性");
+            if let Err(sync_error) = live_sync::sync_to_live(&app_type_enum, &target_provider) {
+                error!("配置同步失败: {}", sync_error);
+
+                // 尝试恢复原配置（如果有）
+                if let Some(ref current) = current_provider {
+                    warn!("尝试恢复原配置: {}", current.name);
+                    if let Err(restore_error) = live_sync::sync_to_live(&app_type_enum, current) {
+                        error!("恢复原配置失败: {}", restore_error);
+                        return Err(format!("切换失败且无法恢复原配置: {}", sync_error));
+                    }
+                }
+
+                return Err(format!("配置同步失败: {}", sync_error));
+            }
         }
 
-        // Set new current provider
-        ProviderDao::set_current(&conn, app_type, id).map_err(|e| e.to_string())?;
+        // Step 3: 更新数据库（同步成功后）
+        info!("更新数据库中的当前 provider");
+        if let Err(db_error) = ProviderDao::set_current(&conn, app_type, id) {
+            error!("数据库更新失败: {}", db_error);
 
-        // Sync target provider to live config
-        if app_type_enum != AppType::ProxyCast {
-            live_sync::sync_to_live(&app_type_enum, &target_provider)
-                .map_err(|e| format!("Failed to sync: {e}"))?;
+            // 如果数据库更新失败，尝试恢复原配置文件
+            if app_type_enum != AppType::ProxyCast {
+                if let Some(ref current) = current_provider {
+                    warn!("数据库更新失败，尝试恢复原配置文件");
+                    if let Err(restore_error) = live_sync::sync_to_live(&app_type_enum, current) {
+                        error!("恢复配置文件失败: {}", restore_error);
+                    }
+                }
+            }
+
+            return Err(db_error.to_string());
         }
 
+        info!("配置切换成功: {} -> {}", app_type, target_provider.name);
         Ok(())
     }
 

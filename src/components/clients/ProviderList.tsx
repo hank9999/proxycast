@@ -102,40 +102,46 @@ function configsMatch(
 
   // 检查是否有任何关键字段匹配
   let hasAnyMatch = false;
+  let hasConflict = false;
 
-  // 比较 env 字段
+  // 比较 env 字段 - 修复：更宽松的匹配逻辑
   for (const key of envKeysToCompare) {
     const liveVal = liveEnv[key] as string | undefined;
     const providerVal = providerEnv[key] as string | undefined;
 
-    if (liveVal && providerVal) {
+    // 如果两个值都存在且不为空，它们必须相等
+    if (liveVal && liveVal.trim() && providerVal && providerVal.trim()) {
       if (liveVal !== providerVal) {
-        return false;
+        hasConflict = true;
+      } else {
+        hasAnyMatch = true;
       }
-      hasAnyMatch = true;
-    } else if (liveVal && !providerVal) {
-      return false;
-    } else if (!liveVal && providerVal && key !== "ANTHROPIC_BASE_URL") {
-      return false;
     }
+    // 如果只有一方有值，不算冲突，但也不算匹配
+    // 这允许配置中可能存在额外的字段
   }
 
   // 比较 Codex auth.OPENAI_API_KEY
   const liveApiKey = liveAuth.OPENAI_API_KEY as string | undefined;
   const providerApiKey = providerAuth.OPENAI_API_KEY as string | undefined;
 
-  if (liveApiKey && providerApiKey) {
+  if (
+    liveApiKey &&
+    liveApiKey.trim() &&
+    providerApiKey &&
+    providerApiKey.trim()
+  ) {
     if (liveApiKey !== providerApiKey) {
-      return false;
+      hasConflict = true;
+    } else {
+      hasAnyMatch = true;
     }
-    hasAnyMatch = true;
-  } else if (liveApiKey && !providerApiKey) {
-    return false;
-  } else if (!liveApiKey && providerApiKey) {
-    return false;
   }
 
-  return hasAnyMatch;
+  // 如果有冲突，返回 false
+  // 如果有任何匹配且无冲突，返回 true
+  // 如果没有匹配也没有冲突（比如配置为空），返回 false
+  return hasAnyMatch && !hasConflict;
 }
 
 // 从实际配置中提取简短描述
@@ -210,6 +216,7 @@ export function ProviderList({ appType }: ProviderListProps) {
   const [showSyncDialog, setShowSyncDialog] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncCheckResult | null>(null);
   const [checkingSync, setCheckingSync] = useState(false);
+  const [switchingId, setSwitchingId] = useState<string | null>(null);
 
   // 实际生效的配置
   const [liveConfig, setLiveConfig] = useState<Record<string, unknown> | null>(
@@ -284,12 +291,15 @@ export function ProviderList({ appType }: ProviderListProps) {
   // 切换到匹配的 provider
   const handleSwitchToMatching = async (provider: Provider) => {
     try {
+      setSwitchingId(provider.id);
       await switchToProvider(provider.id);
       // 切换后重新读取实际配置，更新 UI 状态
       const config = await switchApi.readLiveSettings(appType);
       setLiveConfig(config);
     } catch (e) {
-      alert("切换失败: " + (e instanceof Error ? e.message : String(e)));
+      console.error("切换失败:", e);
+    } finally {
+      setSwitchingId(null);
     }
   };
 
@@ -523,7 +533,20 @@ export function ProviderList({ appType }: ProviderListProps) {
               key={provider.id}
               provider={provider}
               isCurrent={provider.id === currentProvider?.id}
-              onSwitch={() => switchToProvider(provider.id)}
+              switching={switchingId === provider.id}
+              onSwitch={async () => {
+                try {
+                  setSwitchingId(provider.id);
+                  await switchToProvider(provider.id);
+                  // 切换后重新读取实际配置
+                  const config = await switchApi.readLiveSettings(appType);
+                  setLiveConfig(config);
+                } catch (e) {
+                  console.error("切换失败:", e);
+                } finally {
+                  setSwitchingId(null);
+                }
+              }}
               onEdit={() => handleEdit(provider)}
               onDelete={() => handleDeleteClick(provider.id)}
             />

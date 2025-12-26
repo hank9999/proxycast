@@ -506,6 +506,37 @@ impl FlowMemoryStore {
         self.ordered_ids.clear();
     }
 
+    /// 按时间清理 Flow
+    ///
+    /// 删除指定时间之前创建的所有 Flow。
+    ///
+    /// # 参数
+    /// - `before`: 截止时间，早于此时间的 Flow 将被删除
+    ///
+    /// # 返回
+    /// 删除的 Flow 数量
+    pub fn cleanup_before(&mut self, before: chrono::DateTime<chrono::Utc>) -> usize {
+        let mut to_remove = Vec::new();
+
+        for id in &self.ordered_ids {
+            if let Some(flow_lock) = self.flows.get(id) {
+                if let Ok(flow) = flow_lock.read() {
+                    if flow.timestamps.created < before {
+                        to_remove.push(id.clone());
+                    }
+                }
+            }
+        }
+
+        let count = to_remove.len();
+        for id in to_remove {
+            self.flows.remove(&id);
+            self.ordered_ids.retain(|i| i != &id);
+        }
+
+        count
+    }
+
     /// 驱逐最旧的 Flow
     fn evict_oldest(&mut self) {
         if let Some(oldest_id) = self.ordered_ids.pop_front() {

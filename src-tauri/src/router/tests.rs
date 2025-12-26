@@ -242,7 +242,7 @@ proptest! {
         // 两个通配符规则，使用相同的前缀
         let prefix = &model[..model.len().min(3)];
         let pattern1 = format!("{}*", prefix);
-        let pattern2 = format!("{}*-extra", prefix); // 不同的模式但可能都匹配
+        let _pattern2 = format!("{}*-extra", prefix); // 不同的模式但可能都匹配
 
         // 添加优先级更高的规则（数字更小）
         router.add_rule(RoutingRule::new(&pattern1, provider1, priority1));

@@ -373,13 +373,12 @@ export function ProviderForm({
   const generateJsonFromFields = useCallback(() => {
     const env: Record<string, string> = {};
     if (apiKey) {
-      // 同时设置两个 API Key，支持 OpenAI 和 Anthropic 两种协议
+      // Claude Code 只需要 ANTHROPIC_API_KEY，不需要 OPENAI_API_KEY
       env.ANTHROPIC_API_KEY = apiKey;
-      env.OPENAI_API_KEY = apiKey;
     }
     if (baseUrl) {
+      // Claude Code 只需要 ANTHROPIC_BASE_URL，不需要 OPENAI_BASE_URL
       env.ANTHROPIC_BASE_URL = baseUrl;
-      env.OPENAI_BASE_URL = baseUrl;
     }
     if (primaryModel) env.ANTHROPIC_MODEL = primaryModel;
     if (haikuModel) env.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel;

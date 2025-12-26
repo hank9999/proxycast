@@ -327,6 +327,66 @@ export function FlowList({
     }
   };
 
+  // 从模型名推断实际的模型提供商
+  const inferProviderFromModel = (model: string): string | null => {
+    const modelLower = model.toLowerCase();
+
+    // DeepSeek 模型
+    if (modelLower.includes("deepseek")) {
+      return "DeepSeek";
+    }
+    // Claude 模型
+    if (
+      modelLower.includes("claude") ||
+      modelLower.includes("anthropic") ||
+      modelLower.includes("sonnet") ||
+      modelLower.includes("opus") ||
+      modelLower.includes("haiku")
+    ) {
+      return "Claude";
+    }
+    // GPT/OpenAI 模型
+    if (
+      modelLower.includes("gpt") ||
+      modelLower.includes("o1") ||
+      modelLower.includes("o3") ||
+      modelLower.includes("chatgpt")
+    ) {
+      return "OpenAI";
+    }
+    // Gemini 模型
+    if (modelLower.includes("gemini")) {
+      return "Gemini";
+    }
+    // Qwen 模型
+    if (modelLower.includes("qwen") || modelLower.includes("qwq")) {
+      return "Qwen";
+    }
+    // Llama 模型
+    if (modelLower.includes("llama")) {
+      return "Llama";
+    }
+    // Mistral 模型
+    if (modelLower.includes("mistral") || modelLower.includes("mixtral")) {
+      return "Mistral";
+    }
+
+    return null;
+  };
+
+  // 获取显示的提供商名称（优先使用模型推断的提供商）
+  const getDisplayProvider = (
+    metadataProvider: string,
+    model: string,
+  ): string => {
+    const inferredProvider = inferProviderFromModel(model);
+    // 如果能从模型名推断出提供商，且与凭证池不同，则显示推断的提供商
+    if (inferredProvider && inferredProvider !== metadataProvider) {
+      return inferredProvider;
+    }
+    return metadataProvider;
+  };
+
   const getProviderColor = (provider: string) => {
     const colors: Record<string, string> = {
       Kiro: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300",
@@ -339,6 +399,12 @@ export function FlowList({
       Qwen: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300",
       Antigravity:
         "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-300",
+      DeepSeek:
+        "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300",
+      Llama:
+        "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300",
+      Mistral:
+        "bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-300",
     };
     return (
       colors[provider] ||
@@ -553,6 +619,7 @@ export function FlowList({
                 onCopyId={(e) => handleCopyId(e, flow.id)}
                 getStateIcon={getStateIcon}
                 getProviderColor={getProviderColor}
+                getDisplayProvider={getDisplayProvider}
                 formatTime={formatTime}
               />
             ))}
@@ -605,6 +672,7 @@ interface FlowListItemProps {
   onCopyId: (e: React.MouseEvent) => void;
   getStateIcon: (state: FlowState) => React.ReactNode;
   getProviderColor: (provider: string) => string;
+  getDisplayProvider: (metadataProvider: string, model: string) => string;
   formatTime: (timestamp: string) => string;
 }
 
@@ -619,6 +687,7 @@ function FlowListItem({
   onCopyId,
   getStateIcon,
   getProviderColor,
+  getDisplayProvider,
   formatTime,
 }: FlowListItemProps) {
   const hasToolCalls =
@@ -669,14 +738,27 @@ function FlowListItem({
         </span>
 
         {/* 提供商 */}
-        <span
-          className={cn(
-            "text-xs px-2 py-0.5 rounded-full shrink-0",
-            getProviderColor(flow.metadata.provider),
-          )}
-        >
-          {flow.metadata.provider}
-        </span>
+        {(() => {
+          const displayProvider = getDisplayProvider(
+            flow.metadata.provider,
+            flow.request.model,
+          );
+          return (
+            <span
+              className={cn(
+                "text-xs px-2 py-0.5 rounded-full shrink-0",
+                getProviderColor(displayProvider),
+              )}
+              title={
+                displayProvider !== flow.metadata.provider
+                  ? `凭证池: ${flow.metadata.provider}`
+                  : undefined
+              }
+            >
+              {displayProvider}
+            </span>
+          );
+        })()}
 
         {/* 模型 */}
         <span className="text-sm font-medium truncate flex-1 min-w-0">

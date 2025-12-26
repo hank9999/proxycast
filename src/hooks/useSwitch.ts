@@ -62,9 +62,37 @@ export function useSwitch(appType: AppType) {
   };
 
   const switchToProvider = async (id: string) => {
-    await switchApi.switchProvider(appType, id);
-    await fetchProviders();
-    toast.success("切换成功");
+    try {
+      // 显示加载状态
+      const loadingToast = toast.loading("正在切换配置...");
+
+      await switchApi.switchProvider(appType, id);
+      await fetchProviders();
+
+      // 关闭加载提示，显示成功消息
+      toast.dismiss(loadingToast);
+      toast.success("配置切换成功");
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      console.error("配置切换失败:", errorMessage);
+
+      // 提供详细的错误信息
+      if (errorMessage.includes("Provider not found")) {
+        toast.error("配置不存在，请刷新后重试");
+      } else if (errorMessage.includes("Failed to sync")) {
+        toast.error(
+          `配置文件同步失败: ${errorMessage.replace("Failed to sync: ", "")}`,
+        );
+      } else if (errorMessage.includes("Permission denied")) {
+        toast.error("权限不足，请检查配置文件权限");
+      } else {
+        toast.error(`切换失败: ${errorMessage}`);
+      }
+
+      // 重新加载当前状态
+      await fetchProviders();
+      throw e;
+    }
   };
 
   const checkConfigSync = async (): Promise<SyncCheckResult> => {

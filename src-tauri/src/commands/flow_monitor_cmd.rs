@@ -507,6 +507,7 @@ pub async fn cleanup_flows(
             // 清理所有数据 - 使用当前时间 + 1天，确保删除所有数据
             let before = chrono::Utc::now() + chrono::Duration::days(1);
 
+            // 清理文件存储
             if let Some(file_store) = monitor.0.file_store() {
                 match file_store.cleanup(before) {
                     Ok(result) => {
@@ -519,6 +520,14 @@ pub async fn cleanup_flows(
                         return Err(format!("清理所有数据失败: {}", e));
                     }
                 }
+            }
+
+            // 清理内存存储
+            {
+                let memory_store = monitor.0.memory_store();
+                let mut store = memory_store.write().await;
+                store.clear();
+                tracing::info!("已清理内存存储");
             }
         }
 
@@ -546,6 +555,15 @@ pub async fn cleanup_flows(
                     }
                 }
             }
+
+            // 清理内存存储
+            {
+                let memory_store = monitor.0.memory_store();
+                let mut store = memory_store.write().await;
+                let memory_cleaned = store.cleanup_before(before);
+                cleaned_count += memory_cleaned;
+                tracing::info!("已清理内存存储 {} 条记录", memory_cleaned);
+            }
         }
 
         CleanupType::ByCount => {
@@ -562,6 +580,15 @@ pub async fn cleanup_flows(
                         return Err(format!("按数量清理失败: {}", e));
                     }
                 }
+            }
+
+            // 清理内存存储 - 对于按数量清理，清空所有内存数据
+            // 因为文件存储已按保留策略清理，内存应保持一致
+            {
+                let memory_store = monitor.0.memory_store();
+                let mut store = memory_store.write().await;
+                store.clear();
+                tracing::info!("已清理内存存储");
             }
         }
 

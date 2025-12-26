@@ -2,6 +2,51 @@ use crate::models::{AppType, Provider};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// 原子写入 JSON 文件，防止配置损坏
+/// 参考 cc-switch 的实现：使用临时文件 + 重命名的原子操作
+fn write_json_file_atomic(
+    path: &std::path::Path,
+    value: &Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::fs;
+    use std::io::Write;
+
+    // 确保目录存在
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // 创建临时文件
+    let temp_path = path.with_extension("tmp");
+
+    // 写入临时文件
+    let content = serde_json::to_string_pretty(value)?;
+    let mut temp_file = fs::File::create(&temp_path)?;
+    temp_file.write_all(content.as_bytes())?;
+    temp_file.flush()?;
+    drop(temp_file); // 确保文件句柄被释放
+
+    // 验证 JSON 格式正确性
+    let verify_content = fs::read_to_string(&temp_path)?;
+    let _: Value = serde_json::from_str(&verify_content)?; // 验证解析
+
+    // 原子性重命名
+    fs::rename(&temp_path, path)?;
+
+    tracing::info!("Successfully wrote config file: {}", path.display());
+    Ok(())
+}
+
+/// 创建配置文件的备份
+fn create_backup(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if path.exists() {
+        let backup_path = path.with_extension("bak");
+        std::fs::copy(path, &backup_path)?;
+        tracing::info!("Created backup: {}", backup_path.display());
+    }
+    Ok(())
+}
+
 /// Get the configuration file path for an app type
 #[allow(dead_code)]
 pub fn get_app_config_path(app_type: &AppType) -> Option<PathBuf> {
@@ -64,6 +109,11 @@ fn sync_claude_settings(
     let claude_dir = home.join(".claude");
     let config_path = claude_dir.join("settings.json");
 
+    tracing::info!("开始同步 Claude 配置: {}", provider.name);
+
+    // 创建备份（如果文件存在）
+    create_backup(&config_path)?;
+
     // Ensure .claude directory exists
     if !claude_dir.exists() {
         std::fs::create_dir_all(&claude_dir)?;
@@ -72,7 +122,13 @@ fn sync_claude_settings(
     // Read existing settings to preserve other fields
     let mut settings: Value = if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("配置文件格式有误，使用默认配置: {}", e);
+                json!({})
+            }
+        }
     } else {
         json!({})
     };
@@ -93,20 +149,22 @@ fn sync_claude_settings(
         if let Some(target_env) = settings_obj.get_mut("env").and_then(|v| v.as_object_mut()) {
             for (key, value) in env_obj {
                 target_env.insert(key.clone(), value.clone());
+                tracing::debug!("设置环境变量: {} = [MASKED]", key);
             }
         }
     } else {
         // If settings_config is the full settings object, use it directly
         settings = provider.settings_config.clone();
+        tracing::debug!("使用完整配置对象");
     }
 
     // 清理冲突的认证环境变量
     clean_claude_auth_conflict(&mut settings);
 
-    // Write settings
-    let content = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&config_path, content)?;
+    // 使用原子写入
+    write_json_file_atomic(&config_path, &settings)?;
 
+    tracing::info!("Claude 配置同步完成: {}", config_path.display());
     Ok(())
 }
 
@@ -367,12 +425,19 @@ pub fn check_config_sync(
     // 获取配置文件的修改时间
     let last_modified = get_config_last_modified(app_type);
 
-    // 比较配置
+    // 比较配置 - 重要：需要更智能的比对逻辑
     let status = if current_provider == external_provider {
         SyncStatus::InSync
     } else if external_provider == "unknown" {
+        // 外部配置无法识别，可能是配置文件不存在或损坏
         SyncStatus::OutOfSync
     } else {
+        // 这里需要更智能的判断：
+        // 如果外部配置是通过ProxyCast设置的，应该检查是否已有匹配的provider
+        // 只有确实是来自其他外部软件的配置才标记为冲突
+
+        // 对于简化，先标记为冲突，让前端的更详细的比对逻辑来处理
+        // 实际上前端的 configsMatch 函数会做更精确的比对
         SyncStatus::Conflict
     };
 

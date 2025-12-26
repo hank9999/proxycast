@@ -20,6 +20,7 @@ export const availableIcons = [
   "doubao",
   "azure",
   "antigravity",
+  "proxycast",
 ] as const;
 
 // Provider 类型到图标名称的映射
@@ -45,6 +46,7 @@ export const providerTypeToIcon: Record<string, string> = {
   doubao: "doubao",
   azure: "azure",
   aws: "aws",
+  proxycast: "proxycast",
 };
 
 // 获取规范化的图标名称

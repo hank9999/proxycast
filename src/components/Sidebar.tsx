@@ -1,4 +1,11 @@
-import { Settings, Globe, Database, FileCode, Activity } from "lucide-react";
+import {
+  Settings,
+  Globe,
+  Database,
+  FileCode,
+  Activity,
+  Wrench,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 type Page =
@@ -6,6 +13,9 @@ type Page =
   | "config-management"
   | "api-server"
   | "flow-monitor"
+  | "tools"
+  | "browser-interceptor"
+  | "machine-id"
   | "settings";
 
 interface SidebarProps {
@@ -18,6 +28,7 @@ const navItems = [
   { id: "provider-pool" as Page, label: "凭证池", icon: Database },
   { id: "config-management" as Page, label: "配置管理", icon: FileCode },
   { id: "flow-monitor" as Page, label: "Flow Monitor", icon: Activity },
+  { id: "tools" as Page, label: "工具", icon: Wrench },
   { id: "settings" as Page, label: "设置", icon: Settings },
 ];
 

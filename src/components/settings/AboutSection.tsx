@@ -6,6 +6,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { ProviderIcon } from "@/icons/providers";
 
 interface VersionInfo {
   current: string;
@@ -127,8 +128,8 @@ export function AboutSection() {
     <div className="space-y-6 max-w-2xl">
       {/* 应用信息 */}
       <div className="p-6 rounded-lg border text-center space-y-4">
-        <div className="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
-          <span className="text-2xl font-bold text-white">PC</span>
+        <div className="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 flex items-center justify-center">
+          <ProviderIcon providerType="proxycast" size={40} />
         </div>
 
         <div>

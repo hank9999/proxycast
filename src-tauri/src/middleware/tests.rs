@@ -136,7 +136,15 @@ fn test_management_auth_rate_limit_after_failures() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // 使用唯一的 IP 地址避免测试间干扰
-    let client_ip = format!("203.0.113.{}", std::process::id() % 256);
+    // 使用时间戳和进程ID组合来确保唯一性
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let client_ip = format!(
+        "203.0.113.{}",
+        (unique_id ^ std::process::id() as u64) % 256
+    );
     let addr: SocketAddr = format!("{}:12345", client_ip).parse().unwrap();
 
     for _ in 0..5 {

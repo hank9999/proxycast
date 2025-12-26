@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod app_type;
 pub mod codewhisperer;
+pub mod machine_id;
 pub mod mcp_model;
 pub mod openai;
 pub mod prompt_model;

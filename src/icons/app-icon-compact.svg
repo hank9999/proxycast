@@ -1,24 +1,42 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <defs>
+    <!-- 纯黑背景 -->
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#6366f1"/>
-      <stop offset="100%" style="stop-color:#8b5cf6"/>
+      <stop offset="0%" style="stop-color:#000000"/>
+      <stop offset="100%" style="stop-color:#0a0a0a"/>
+    </linearGradient>
+
+    <!-- P字母左侧渐变：蓝色系 -->
+    <linearGradient id="leftP" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4fc3f7"/>
+      <stop offset="100%" style="stop-color:#1a237e"/>
+    </linearGradient>
+
+    <!-- P字母右侧渐变：紫色系 -->
+    <linearGradient id="rightP" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7c4dff"/>
+      <stop offset="100%" style="stop-color:#e91e63"/>
     </linearGradient>
   </defs>
-  
+
   <!-- 圆角矩形背景 -->
   <rect x="8" y="8" width="112" height="112" rx="24" ry="24" fill="url(#bg)"/>
-  
-  <!-- 简化的代理符号 -->
-  <g fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
-    <!-- 左箭头 -->
-    <path d="M30 64 L50 64 M30 64 L38 56 M30 64 L38 72"/>
-    <!-- 中心圆 -->
-    <circle cx="64" cy="64" r="14" fill="rgba(255,255,255,0.2)" stroke="#ffffff" stroke-width="3"/>
-    <!-- 右箭头 -->
-    <path d="M78 64 L98 64 M98 64 L90 56 M98 64 L90 72"/>
+
+  <!-- 简化的 P 字母 -->
+  <g>
+    <!-- P 的左竖条 -->
+    <rect x="36" y="32" width="10" height="64" rx="3" fill="url(#leftP)"/>
+
+    <!-- P 的上横条 -->
+    <rect x="46" y="32" width="28" height="9" rx="3" fill="url(#rightP)"/>
+
+    <!-- P 的中横条 -->
+    <rect x="46" y="60" width="24" height="8" rx="2" fill="url(#rightP)"/>
+
+    <!-- P 的右竖条（上半部分） -->
+    <rect x="70" y="41" width="8" height="27" rx="3" fill="url(#rightP)"/>
   </g>
-  
-  <!-- 中心 P -->
-  <text x="64" y="71" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#ffffff" text-anchor="middle">P</text>
+
+  <!-- 简单光晕 -->
+  <circle cx="64" cy="64" r="42" fill="none" stroke="url(#rightP)" stroke-width="0.5" opacity="0.3"/>
 </svg>

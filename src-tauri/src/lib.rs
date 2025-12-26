@@ -1,3 +1,4 @@
+pub mod browser_interceptor;
 mod commands;
 mod config;
 mod converter;
@@ -27,11 +28,13 @@ use std::sync::Arc;
 use tauri::{Manager, Runtime};
 use tokio::sync::RwLock;
 
+use commands::browser_interceptor_cmd::BrowserInterceptorState;
 use commands::flow_monitor_cmd::{
     BatchOperationsState, BookmarkManagerState, EnhancedStatsServiceState, FlowInterceptorState,
     FlowMonitorState, FlowQueryServiceState, FlowReplayerState, QuickFilterManagerState,
     SessionManagerState,
 };
+use commands::machine_id_cmd::MachineIdState;
 use commands::plugin_cmd::PluginManagerState;
 use commands::provider_pool_cmd::{CredentialSyncServiceState, ProviderPoolServiceState};
 use commands::resilience_cmd::ResilienceConfigState;
@@ -1530,6 +1533,11 @@ pub fn run() {
     let token_cache_service = TokenCacheService::new();
     let token_cache_service_state = TokenCacheServiceState(Arc::new(token_cache_service));
 
+    // Initialize MachineIdService
+    let machine_id_service = services::machine_id_service::MachineIdService::new()
+        .expect("Failed to initialize MachineIdService");
+    let machine_id_service_state: MachineIdState = Arc::new(RwLock::new(machine_id_service));
+
     // Initialize RouterConfigState
     let router_config_state = RouterConfigState::default();
 
@@ -1635,6 +1643,9 @@ pub fn run() {
     ));
     let batch_operations_state = BatchOperationsState(batch_operations);
 
+    // Initialize BrowserInterceptorState
+    let browser_interceptor_state = BrowserInterceptorState::default();
+
     // FlowQueryService 需要 file_store，如果没有则创建一个临时的
     let flow_query_service_state = if let Some(file_store) = flow_file_store {
         let query_service = FlowQueryService::new(flow_monitor.memory_store(), file_store);
@@ -1670,13 +1681,46 @@ pub fn run() {
     let flow_monitor_clone = flow_monitor.clone();
     let flow_interceptor_clone = flow_interceptor.clone();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
+        // 单实例插件：当第二个实例启动时，将 URL 传递给第一个实例
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            tracing::info!("[单实例] 收到来自新实例的参数: {:?}", args);
+
+            // 处理传入的 URL 参数
+            for arg in args.iter().skip(1) {
+                // 跳过第一个参数（程序路径）
+                if arg.starts_with("http://") || arg.starts_with("https://") {
+                    tracing::info!("[单实例] 收到 URL: {}", arg);
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::browser_interceptor::platform::macos::handle_deep_link_url(
+                            arg.clone(),
+                        );
+                    }
+                }
+            }
+
+            // 将窗口带到前台
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+
+    // 添加 Deep Link 插件（用于浏览器拦截）
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_plugin_deep_link::init());
+    }
+
+    builder
         .manage(state)
         .manage(logs)
         .manage(db)
@@ -1684,6 +1728,7 @@ pub fn run() {
         .manage(provider_pool_service_state)
         .manage(credential_sync_service_state)
         .manage(token_cache_service_state)
+        .manage(machine_id_service_state)
         .manage(router_config_state)
         .manage(resilience_config_state)
         .manage(telemetry_state)
@@ -1697,6 +1742,7 @@ pub fn run() {
         .manage(bookmark_manager_state)
         .manage(enhanced_stats_service_state)
         .manage(batch_operations_state)
+        .manage(browser_interceptor_state)
         .on_window_event(move |window, event| {
             // 处理窗口关闭事件
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1723,6 +1769,21 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // 设置 deep-link 事件监听（用于浏览器拦截）
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _listener_id = app.deep_link().on_open_url(|event| {
+                    for url in event.urls() {
+                        tracing::info!("[Deep Link] 收到 URL: {}", url);
+                        crate::browser_interceptor::platform::macos::handle_deep_link_url(
+                            url.to_string(),
+                        );
+                    }
+                });
+                tracing::info!("[启动] Deep Link 事件监听已设置");
+            }
+
             // 初始化托盘管理器
             // Requirements 1.4: 应用启动时显示停止状态图标
             match TrayManager::new(app.handle()) {
@@ -2241,8 +2302,45 @@ pub fn run() {
             commands::window_cmd::set_window_size_by_option,
             commands::window_cmd::toggle_fullscreen,
             commands::window_cmd::is_fullscreen,
+            // Browser Interceptor commands
+            commands::browser_interceptor_cmd::get_browser_interceptor_state,
+            commands::browser_interceptor_cmd::start_browser_interceptor,
+            commands::browser_interceptor_cmd::stop_browser_interceptor,
+            commands::browser_interceptor_cmd::restore_normal_browser_behavior,
+            commands::browser_interceptor_cmd::temporary_disable_interceptor,
+            commands::browser_interceptor_cmd::get_intercepted_urls,
+            commands::browser_interceptor_cmd::get_interceptor_history,
+            commands::browser_interceptor_cmd::copy_intercepted_url_to_clipboard,
+            commands::browser_interceptor_cmd::open_url_in_fingerprint_browser,
+            commands::browser_interceptor_cmd::dismiss_intercepted_url,
+            commands::browser_interceptor_cmd::update_browser_interceptor_config,
+            commands::browser_interceptor_cmd::get_default_browser_interceptor_config,
+            commands::browser_interceptor_cmd::validate_browser_interceptor_config,
+            commands::browser_interceptor_cmd::is_browser_interceptor_running,
+            commands::browser_interceptor_cmd::get_browser_interceptor_statistics,
+            // Browser Interceptor notification commands
+            commands::browser_interceptor_cmd::show_notification,
+            commands::browser_interceptor_cmd::show_url_intercept_notification,
+            commands::browser_interceptor_cmd::show_status_notification,
             // Auto fix commands
             commands::auto_fix_cmd::auto_fix_configuration,
+            // Machine ID commands
+            commands::machine_id_cmd::get_current_machine_id,
+            commands::machine_id_cmd::set_machine_id,
+            commands::machine_id_cmd::generate_random_machine_id,
+            commands::machine_id_cmd::validate_machine_id,
+            commands::machine_id_cmd::check_admin_privileges,
+            commands::machine_id_cmd::get_os_type,
+            commands::machine_id_cmd::backup_machine_id_to_file,
+            commands::machine_id_cmd::restore_machine_id_from_file,
+            commands::machine_id_cmd::format_machine_id,
+            commands::machine_id_cmd::detect_machine_id_format,
+            commands::machine_id_cmd::convert_machine_id_format,
+            commands::machine_id_cmd::get_machine_id_history,
+            commands::machine_id_cmd::clear_machine_id_override,
+            commands::machine_id_cmd::copy_machine_id_to_clipboard,
+            commands::machine_id_cmd::paste_machine_id_from_clipboard,
+            commands::machine_id_cmd::get_system_info,
             // Network commands
             commands::network_cmd::get_network_info,
         ])

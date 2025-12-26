@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <defs>
+    <!-- P字母左侧渐变：蓝色系 -->
+    <linearGradient id="leftP" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4fc3f7"/>
+      <stop offset="100%" style="stop-color:#1a237e"/>
+    </linearGradient>
+    <!-- P字母右侧渐变：紫色系 -->
+    <linearGradient id="rightP" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7c4dff"/>
+      <stop offset="100%" style="stop-color:#e91e63"/>
+    </linearGradient>
+  </defs>
+
+  <!-- P 字母形状 -->
+  <!-- 左竖条 -->
+  <rect x="4" y="4" width="3" height="16" rx="1" fill="url(#leftP)"/>
+
+  <!-- 上横条 -->
+  <rect x="7" y="4" width="8" height="2.5" rx="1" fill="url(#rightP)"/>
+
+  <!-- 中横条 -->
+  <rect x="7" y="11" width="6.5" height="2.2" rx="0.8" fill="url(#rightP)"/>
+
+  <!-- 右竖条（上半部分） -->
+  <rect x="15" y="6.5" width="2.5" height="6.7" rx="1" fill="url(#rightP)"/>
+</svg>

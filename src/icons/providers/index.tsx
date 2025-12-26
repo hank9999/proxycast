@@ -21,6 +21,7 @@ import MinimaxIcon from "./minimax.svg?react";
 import DoubaoIcon from "./doubao.svg?react";
 import AzureIcon from "./azure.svg?react";
 import AntigravityIcon from "./antigravity.svg?react";
+import ProxycastIcon from "./proxycast.svg?react";
 
 // 图标组件映射
 const iconComponents: Record<string, ComponentType<SVGProps<SVGSVGElement>>> = {
@@ -42,6 +43,7 @@ const iconComponents: Record<string, ComponentType<SVGProps<SVGSVGElement>>> = {
   doubao: DoubaoIcon,
   azure: AzureIcon,
   antigravity: AntigravityIcon,
+  proxycast: ProxycastIcon,
 };
 
 interface ProviderIconProps {

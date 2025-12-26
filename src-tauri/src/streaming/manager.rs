@@ -1522,7 +1522,7 @@ mod tests {
         assert!(final_callback_count >= 1, "至少应该有一次回调");
 
         // 检查节流计数
-        let throttled = managed.throttled_event_count();
+        let _throttled = managed.throttled_event_count();
         let total_callbacks = managed.callback_count();
 
         // 总回调次数 + 被节流次数 应该等于处理的事件数
