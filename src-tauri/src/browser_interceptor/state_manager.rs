@@ -265,7 +265,7 @@ impl StateManager {
 
             if result.is_ok() {
                 let mut buffer = vec![0u16; 1024];
-                let mut buffer_size = buffer.len() * 2;
+                let mut buffer_size: u32 = (buffer.len() * 2) as u32;
 
                 let result = RegQueryValueExW(
                     key,
@@ -273,13 +273,13 @@ impl StateManager {
                     None,
                     None,
                     Some(buffer.as_mut_ptr() as *mut u8),
-                    Some(&mut buffer_size as *mut u32),
+                    Some(&mut buffer_size),
                 );
 
                 RegCloseKey(key);
 
                 if result.is_ok() {
-                    let prog_id = String::from_utf16_lossy(&buffer[..buffer_size / 2 - 1]);
+                    let prog_id = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2 - 1]);
                     return Ok(Some(prog_id));
                 }
             }
@@ -327,7 +327,7 @@ impl StateManager {
 
             if result.is_ok() {
                 let mut buffer = vec![0u16; 1024];
-                let mut buffer_size = buffer.len() * 2;
+                let mut buffer_size: u32 = (buffer.len() * 2) as u32;
 
                 let result = RegQueryValueExW(
                     key,
@@ -335,13 +335,13 @@ impl StateManager {
                     None,
                     None,
                     Some(buffer.as_mut_ptr() as *mut u8),
-                    Some(&mut buffer_size as *mut u32),
+                    Some(&mut buffer_size),
                 );
 
                 RegCloseKey(key);
 
                 if result.is_ok() {
-                    let value = String::from_utf16_lossy(&buffer[..buffer_size / 2 - 1]);
+                    let value = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2 - 1]);
                     return Ok(value);
                 }
             }
@@ -448,14 +448,17 @@ impl StateManager {
             if result.is_ok() {
                 let value_name_wide = to_wide_chars(value_name);
                 let value_data_wide = to_wide_chars(value_data);
+                let value_bytes: &[u8] = std::slice::from_raw_parts(
+                    value_data_wide.as_ptr() as *const u8,
+                    value_data_wide.len() * 2,
+                );
 
                 RegSetValueExW(
                     key,
                     PCWSTR::from_raw(value_name_wide.as_ptr()),
                     0,
                     REG_SZ,
-                    Some(value_data_wide.as_ptr() as *const u8),
-                    value_data_wide.len() * 2,
+                    Some(value_bytes),
                 );
 
                 RegCloseKey(key);
