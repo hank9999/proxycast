@@ -254,15 +254,7 @@ pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CW
 
         let final_thinking = thinking_text;
         if !final_thinking.trim().is_empty() {
-            let signature = thinking_signature.or_else(|| {
-                let sig = generate_thinking_signature(&final_thinking);
-                if sig.trim().is_empty() {
-                    None
-                } else {
-                    Some(sig)
-                }
-            });
-
+            let signature = thinking_signature.or(None);
             result.thinking = Some(CWThinkingContent {
                 text: final_thinking,
                 signature,
@@ -274,15 +266,6 @@ pub fn parse_cw_response_with_options(body: &str, options: CWParseOptions) -> CW
     parse_bracket_tool_calls(&mut result);
 
     result
-}
-
-/// 生成 thinking 的 signature（SHA256 + Base64）
-fn generate_thinking_signature(thinking_content: &str) -> String {
-    if thinking_content.trim().is_empty() {
-        return String::new();
-    }
-    let hash = Sha256::digest(thinking_content.as_bytes());
-    BASE64_STANDARD.encode(hash)
 }
 
 /// 从 content 中提取 `<thinking>...</thinking>` 标签内容
@@ -868,32 +851,5 @@ mod tests {
         );
 
         assert_eq!(extract_json_from_bytes(b"not json"), None);
-    }
-
-    #[test]
-    fn test_anthropic_stream_thinking_signature_format() {
-        let mut parsed = CWParsedResponse::default();
-        parsed.thinking = Some(CWThinkingContent {
-            text: "hello".to_string(),
-            signature: Some("sig123".to_string()),
-        });
-
-        let events = build_anthropic_stream_events("claude-test-thinking", "msg_test", &parsed, "end_turn");
-
-        // 1) thinking 的 content_block_start 不应该带 signature 字段
-        let thinking_start = events
-            .iter()
-            .find(|e| e.contains("event: content_block_start") && e.contains("\"type\":\"thinking\""))
-            .expect("missing thinking content_block_start");
-        assert!(
-            !thinking_start.contains("\"signature\""),
-            "thinking content_block_start 不应包含 signature"
-        );
-
-        // 2) 必须存在 signature_delta
-        assert!(
-            events.iter().any(|e| e.contains("\"type\":\"signature_delta\"") && e.contains("sig123")),
-            "缺少 signature_delta"
-        );
     }
 }

@@ -435,12 +435,6 @@ pub struct StreamConverter {
     text_block_index: Option<u32>,
     /// 当前打开的 thinking 内容块索引（Anthropic）
     thinking_block_index: Option<u32>,
-    /// thinking 的 signature（Anthropic），需要以 signature_delta 的形式输出
-    ///
-    /// Anthropic 官方流式协议要求：
-    /// - content_block_start 的 thinking 块不包含 signature 字段
-    /// - signature 通过 content_block_delta 的 signature_delta 发送（通常在 thinking 结束前）
-    anthropic_thinking_signature_pending: Option<String>,
     /// 是否已发送 message_start（用于 Anthropic 格式）
     message_started: bool,
     /// 累积的内容（用于重建完整响应）
@@ -469,7 +463,6 @@ impl StreamConverter {
             next_content_block_index: 0,
             text_block_index: None,
             thinking_block_index: None,
-            anthropic_thinking_signature_pending: None,
             message_started: false,
             accumulated_content: String::new(),
             kiro_thinking_tag_parser: KiroThinkingTagParser::new(),
@@ -509,7 +502,6 @@ impl StreamConverter {
         self.next_content_block_index = 0;
         self.text_block_index = None;
         self.thinking_block_index = None;
-        self.anthropic_thinking_signature_pending = None;
         self.message_started = false;
         self.accumulated_content.clear();
         self.kiro_thinking_tag_parser.reset();
@@ -1127,18 +1119,6 @@ impl StreamConverter {
         format!("event: content_block_delta\ndata: {}\n\n", event)
     }
 
-    fn create_anthropic_signature_delta(&self, index: u32, signature: &str) -> String {
-        let event = serde_json::json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {
-                "type": "signature_delta",
-                "signature": signature
-            }
-        });
-        format!("event: content_block_delta\ndata: {}\n\n", event)
-    }
-
     fn create_anthropic_input_json_delta(&self, index: u32, partial_json: &str) -> String {
         let event = serde_json::json!({
             "type": "content_block_delta",
@@ -1163,12 +1143,6 @@ impl StreamConverter {
         let Some(thinking_idx) = self.thinking_block_index.take() else {
             return;
         };
-
-        if let Some(sig) = self.anthropic_thinking_signature_pending.take() {
-            // 官方流里经常在 signature_delta 前额外出现一次空的 thinking_delta
-            events.push(self.create_anthropic_thinking_delta(thinking_idx, ""));
-            events.push(self.create_anthropic_signature_delta(thinking_idx, &sig));
-        }
 
         events.push(self.create_anthropic_content_block_stop(thinking_idx));
     }
